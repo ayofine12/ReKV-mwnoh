@@ -31,7 +31,7 @@ MODELS = {
         'load_func': llava_onevision_rekv.load_model,
         'model_class': LlavaOnevisionForConditionalGeneration,
         'processor_class': LlavaOnevisionProcessor,
-        'model_path': 'model_zoo/llava-onevision-qwen2-7b-ov-hf',
+        'model_path': '/mnt/models/llava_ov_7b-hf',
     },
     'llava_ov_72b': {
         'load_func': llava_onevision_rekv.load_model,
@@ -56,7 +56,8 @@ class BaseVQA:
     def __init__(self, anno, save_dir, sample_fps,
                  qa_model, qa_processor=None,
                  num_chunks=None, chunk_idx=None,
-                 retrieve_size=64, chunk_size=1) -> None:
+                 retrieve_size=64, chunk_size=1, encode_chunk_size=8,
+                 n_local=15000, kv_repr="mean", q_repr="mean") -> None:
         
         self.sample_fps = sample_fps
 
@@ -67,6 +68,12 @@ class BaseVQA:
         assert chunk_size <= retrieve_size, f'chunk_size: {chunk_size}, retrieve_size: {retrieve_size}'
         self.retrieve_size = retrieve_size
         self.chunk_size = chunk_size
+        self.encode_chunk_size = encode_chunk_size
+        self.n_local = n_local
+        self.kv_repr = kv_repr
+        self.q_repr = q_repr
+
+        self.retrieval_tag = f'kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}'
 
         self.num_chunks = num_chunks
         self.chunk_idx = chunk_idx
@@ -150,6 +157,19 @@ class BaseVQA:
     def analyze_a_video(self, video_sample):
         pass
 
+    def save_result_to_csv(self, result_dict):
+        """Save a single result to CSV file by appending"""
+        csv_path = f'{self.save_dir}/{self.retrieval_tag}/n{self.n_local}/{self.retrieval_tag}_rs{self.retrieve_size}_cs{self.chunk_size}_n{self.n_local}_accuracy.csv'
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        
+        df = pd.DataFrame([result_dict])
+        
+        # Check if file exists to determine if we need to write header
+        file_exists = os.path.exists(csv_path)
+        df.to_csv(csv_path, mode='a', header=not file_exists, index=False)
+
     def analyze(self, debug=False):
         video_annos = self.anno[:1] if debug else self.anno
         for video_sample in tqdm(video_annos):
@@ -189,6 +209,9 @@ def work(QA_CLASS):
     parser.add_argument("--n_local", type=int, default=15000)
     parser.add_argument("--retrieve_size", type=int, default=64)
     parser.add_argument("--retrieve_chunk_size", type=int, default=1)
+    parser.add_argument("--encode_chunk_size", type=int, default=8)
+    parser.add_argument("--kv_repr", type=str, default="mean")
+    parser.add_argument("--q_repr", type=str, default="mean")
     parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True)
     args = parser.parse_args()
 
@@ -223,6 +246,10 @@ def work(QA_CLASS):
         qa_processor=videoqa_processor,
         retrieve_size=args.retrieve_size,
         chunk_size=args.retrieve_chunk_size,
+        encode_chunk_size=args.encode_chunk_size,
+        n_local=args.n_local,
+        kv_repr=args.kv_repr,
+        q_repr=args.q_repr,
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,
         save_dir=args.save_dir,
