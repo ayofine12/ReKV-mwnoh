@@ -179,6 +179,17 @@ class VectorTensor:
         assert logits.dim() == 1 and logits.size(0) == self.length
         return logits
 
+    def get_topk_mean_similarity_token_q(self, query_tokens: torch.Tensor, topk_count: int):
+        assert query_tokens.dim() == 2 and query_tokens.size(1) == self.hidden_size
+        if self.length == 0:
+            return torch.empty((0,), device=self.data.device, dtype=torch.float32)
+
+        key = self.data[:self.length].float()  # (n_frame, hidden_dim)
+        query = query_tokens.float()  # (q_len, hidden_dim)
+        sim = torch.matmul(query, key.T).transpose(0, 1)  # (n_frame, q_len)
+        keep = max(1, min(topk_count, sim.size(-1)))
+        return sim.topk(keep, dim=-1).values.mean(dim=-1)
+
     def __len__(self):
         return self.length
 
@@ -191,6 +202,8 @@ class ContextManager:
                  position_embedding,
                  n_init, n_local, 
                  block_size, max_cached_block, topk, chunk_size, exc_block_size, 
+                 kv_repr: str = "mean",
+                 q_repr: str = "mean",
                  fattn: bool = False,
                  async_global_stream: bool = False,
                  pin_memory: bool = False,
@@ -206,6 +219,13 @@ class ContextManager:
         assert exc_block_size <= n_local # no global token in input
         self.topk = topk
         self.chunk_size = chunk_size
+        self.kv_repr = kv_repr
+        self.q_repr = q_repr
+        self.q_topk_ratio = 0.3
+        if self.kv_repr != "mean":
+            raise ValueError(f"Unsupported kv_repr: {self.kv_repr}. This branch currently supports only 'mean'.")
+        if self.q_repr not in {"mean", "token"}:
+            raise ValueError(f"Unsupported q_repr: {self.q_repr}. Choose from {{'mean', 'token'}}.")
         self.Attn, _ = get_multi_stage_dot_production_attention(fattn)
         self.fattn = fattn
         self.initialized = False
@@ -417,14 +437,23 @@ class ContextManager:
         assert global_h_k.size(-2) <= self.n_init + self.n_local
         return global_h_k, global_h_v 
 
+    def _get_q_token_topk(self, q_len: int) -> int:
+        return max(1, math.ceil(self.q_topk_ratio * q_len))
+
     # Get the indices of the top-k vectors in self.block_k[u] that have the highest similarity with global_h_q[u].
     # ret: batch_size x topk
     def _calc_block_topk(
         self, global_h_q
     ):
-        global_h_q = global_h_q.mean(dim=2, keepdim=False)  # (batch_size, num_heads, dim_head)
-        assert global_h_q.shape == (self.num_units, self.unit_size, self.dim_head)
-        global_h_q = global_h_q.reshape(self.num_units, self.dim_head * self.unit_size)  # (batch_size, dim_head * num_heads)
+        q_len = global_h_q.size(2)
+        if self.q_repr == "mean":
+            global_h_q = global_h_q.mean(dim=2, keepdim=False)  # (batch_size, num_heads, dim_head)
+            assert global_h_q.shape == (self.num_units, self.unit_size, self.dim_head)
+            global_h_q = global_h_q.reshape(self.num_units, self.dim_head * self.unit_size)  # (batch_size, dim_head * num_heads)
+        else:
+            global_h_q = global_h_q.transpose(1, 2).contiguous().reshape(
+                self.num_units, q_len, self.dim_head * self.unit_size
+            )  # (batch_size, q_len, dim_head * num_heads)
         logits = None
 
         if self.num_global_block <= self.topk:
@@ -441,11 +470,24 @@ class ContextManager:
                     global_k = global_k.transpose(1, 2)  # (batch_size, length - n_init, num_heads, dim_head)
                     global_k = global_k.reshape(self.num_units, block_num, self.block_size, self.unit_size * self.dim_head)  # (batch_size, block_num, block_size, dim)
                     global_k = global_k.mean(dim=-2, keepdim=False)  # (batch_size, block_num, dim)
-                    logits = torch.matmul(global_k, global_h_q[:, :, None]).squeeze(dim=-1)  # (batch_size, block_num)
+                    if self.q_repr == "mean":
+                        logits = torch.matmul(global_k, global_h_q[:, :, None]).squeeze(dim=-1)  # (batch_size, block_num)
+                    else:
+                        q_topk = self._get_q_token_topk(q_len)
+                        sim = torch.einsum("bnd,bqd->bnq", global_k.float(), global_h_q.float())  # (batch_size, block_num, q_len)
+                        keep = max(1, min(q_topk, sim.size(-1)))
+                        logits = sim.topk(keep, dim=-1).values.mean(dim=-1)  # (batch_size, block_num)
             else:  # The local window is already filled, but the number of input frames is less than 'topk'.
                 ret = [list(range(len(self.global_blocks[0]))) for _ in range(self.num_units)]
         else:
-            logits = torch.stack([self.block_k[u].get_cosine_similarity(global_h_q[u]) for u in range(self.num_units)])  # (batch_size, block_num)
+            if self.q_repr == "mean":
+                logits = torch.stack([self.block_k[u].get_cosine_similarity(global_h_q[u]) for u in range(self.num_units)])  # (batch_size, block_num)
+            else:
+                q_topk = self._get_q_token_topk(q_len)
+                logits = torch.stack([
+                    self.block_k[u].get_topk_mean_similarity_token_q(global_h_q[u], q_topk)
+                    for u in range(self.num_units)
+                ])  # (batch_size, block_num)
 
         if logits is not None:
             self.similarity = logits

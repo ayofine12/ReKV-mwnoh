@@ -234,6 +234,8 @@ def work(QA_CLASS):
         n_local=args.n_local,
         topk=args.retrieve_size,
         chunk_size=args.retrieve_chunk_size,
+        kv_repr=args.kv_repr,
+        q_repr=args.q_repr,
     )
 
     # Load ground truth file

@@ -10,6 +10,8 @@ def rekv_attention_forward(
     n_local, n_init, topk, chunk_size,
     block_size, max_cached_block,
     exc_block_size, fattn,
+    kv_repr="mean",
+    q_repr="mean",
     async_global_stream=True,
     pin_memory=False,
     *args, **kwargs
@@ -53,9 +55,11 @@ def rekv_attention_forward(
                 position_bias,
                 n_init, n_local, 
                 block_size, max_cached_block, topk, chunk_size, exc_block_size,
-                fattn,
-                async_global_stream,
-                pin_memory,
+                kv_repr=kv_repr,
+                q_repr=q_repr,
+                fattn=fattn,
+                async_global_stream=async_global_stream,
+                pin_memory=pin_memory,
             )
 
         local_q, local_k, local_v = h_q, h_k, h_v

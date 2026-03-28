@@ -114,7 +114,8 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         return output
 
 
-def load_model(model_path='model_zoo/Video-LLaVA-7B-hf', n_init=None, n_local=None, topk=8, chunk_size=1):
+def load_model(model_path='model_zoo/Video-LLaVA-7B-hf', n_init=None, n_local=None, topk=8, chunk_size=1,
+               kv_repr="mean", q_repr="mean"):
     device = 'cuda'
     n_frame_tokens = 257
     processor = VideoLlavaProcessor.from_pretrained(model_path)
@@ -131,6 +132,8 @@ def load_model(model_path='model_zoo/Video-LLaVA-7B-hf', n_init=None, n_local=No
         'max_cached_block': 128,
         'exc_block_size': n_frame_tokens,
         'pin_memory': True,
+        'kv_repr': kv_repr,
+        'q_repr': q_repr,
     }
     model = VideoLlava_ReKV.from_pretrained(
         model_path, 
