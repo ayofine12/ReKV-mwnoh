@@ -108,7 +108,9 @@ class LlavaOneVision_ReKV(LlavaOnevisionForConditionalGeneration, Abstract_ReKV)
 
 def load_model(model_path='model_zoo/LLaVA/llava-onevision-qwen2-7b-ov-hf',
                n_init=None, n_local=None, topk=64, chunk_size=1,
-               kv_repr="mean", q_repr="mean"):
+               kv_repr="mean", q_repr="mean", q_token_agg="topk", q_topk_ratio=0.3,
+               k_token_agg="max", k_topk_ratio=0.3,
+               head_specific_retrieval=False):
     device = 'cuda'
     n_frame_tokens = 196
     processor = LlavaOnevisionProcessor.from_pretrained(model_path)
@@ -127,6 +129,11 @@ def load_model(model_path='model_zoo/LLaVA/llava-onevision-qwen2-7b-ov-hf',
         'pin_memory': True,
         'kv_repr': kv_repr,
         'q_repr': q_repr,
+        'q_token_agg': q_token_agg,
+        'q_topk_ratio': q_topk_ratio,
+        'k_token_agg': k_token_agg,
+        'k_topk_ratio': k_topk_ratio,
+        'head_specific_retrieval': head_specific_retrieval,
     }
     model = LlavaOneVision_ReKV.from_pretrained(
         model_path, 

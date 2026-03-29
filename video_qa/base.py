@@ -57,9 +57,13 @@ class BaseVQA:
                  qa_model, qa_processor=None,
                  num_chunks=None, chunk_idx=None,
                  retrieve_size=64, chunk_size=1, encode_chunk_size=8,
-                 n_local=15000, kv_repr="mean", q_repr="mean") -> None:
+                 n_local=15000, kv_repr="mean", q_repr="mean",
+                 q_token_agg="topk", q_topk_ratio=0.3,
+                 k_token_agg="max", k_topk_ratio=0.3,
+                 head_specific_retrieval=False, use_video_cache=True) -> None:
         
         self.sample_fps = sample_fps
+        self.use_video_cache = use_video_cache
 
         self.qa_model = qa_model
         self.qa_processor = qa_processor
@@ -72,8 +76,38 @@ class BaseVQA:
         self.n_local = n_local
         self.kv_repr = kv_repr
         self.q_repr = q_repr
+        self.q_token_agg = q_token_agg
+        self.q_topk_ratio = q_topk_ratio
+        self.k_token_agg = k_token_agg
+        self.k_topk_ratio = k_topk_ratio
+        self.head_specific_retrieval = head_specific_retrieval
 
-        self.retrieval_tag = f'kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}'
+        if kv_repr == "mean":
+            if q_repr == "mean":
+                self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}'
+            else:
+                if q_token_agg == "mean":
+                    self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}'
+                else:
+                    self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}-qtopk_{q_topk_ratio}'
+
+        else:
+            if k_token_agg == "max":
+                if q_repr == "mean":
+                    self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-kagg_{k_token_agg}'
+                else:
+                    if q_token_agg == "mean":
+                        self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}-kagg_{k_token_agg}'
+                    else:
+                        self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}-qtopk_{q_topk_ratio}-kagg_{k_token_agg}'
+            else:
+                if q_repr == "mean":
+                    self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-kagg_{k_token_agg}-ktopk_{k_topk_ratio}'
+                else:
+                    if q_token_agg == "mean":
+                        self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}-kagg_{k_token_agg}-ktopk_{k_topk_ratio}'
+                    else:
+                        self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}-qtopk_{q_topk_ratio}-kagg_{k_token_agg}-ktopk_{k_topk_ratio}'
 
         self.num_chunks = num_chunks
         self.chunk_idx = chunk_idx
@@ -212,6 +246,12 @@ def work(QA_CLASS):
     parser.add_argument("--encode_chunk_size", type=int, default=8)
     parser.add_argument("--kv_repr", type=str, default="mean")
     parser.add_argument("--q_repr", type=str, default="mean")
+    parser.add_argument("--q_token_agg", type=str, default="topk", choices=["mean", "topk"])
+    parser.add_argument("--q_topk_ratio", type=float, default=0.3)
+    parser.add_argument("--k_token_agg", type=str, default="max", choices=["max", "topk"])
+    parser.add_argument("--k_topk_ratio", type=float, default=0.3)
+    parser.add_argument("--head_specific_retrieval", type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument("--use_video_cache", type=str2bool, nargs='?', const=True, default=True)
     parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True)
     args = parser.parse_args()
 
@@ -236,6 +276,11 @@ def work(QA_CLASS):
         chunk_size=args.retrieve_chunk_size,
         kv_repr=args.kv_repr,
         q_repr=args.q_repr,
+        q_token_agg=args.q_token_agg,
+        q_topk_ratio=args.q_topk_ratio,
+        k_token_agg=args.k_token_agg,
+        k_topk_ratio=args.k_topk_ratio,
+        head_specific_retrieval=args.head_specific_retrieval,
     )
 
     # Load ground truth file
@@ -252,6 +297,12 @@ def work(QA_CLASS):
         n_local=args.n_local,
         kv_repr=args.kv_repr,
         q_repr=args.q_repr,
+        q_token_agg=args.q_token_agg,
+        q_topk_ratio=args.q_topk_ratio,
+        k_token_agg=args.k_token_agg,
+        k_topk_ratio=args.k_topk_ratio,
+        head_specific_retrieval=args.head_specific_retrieval,
+        use_video_cache=args.use_video_cache,
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,
         save_dir=args.save_dir,

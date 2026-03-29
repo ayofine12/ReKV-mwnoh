@@ -110,7 +110,9 @@ class LongVA_ReKV(LlavaQwenForCausalLM, Abstract_ReKV):
 
 def load_model(model_path='model_zoo/LongVA-7B',
                n_init=None, n_local=8000, topk=32, chunk_size=1,
-               kv_repr="mean", q_repr="mean"):
+               kv_repr="mean", q_repr="mean", q_token_agg="topk", q_topk_ratio=0.3,
+               k_token_agg="max", k_topk_ratio=0.3,
+               head_specific_retrieval=False):
     n_frame_tokens = 144
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     
@@ -128,6 +130,11 @@ def load_model(model_path='model_zoo/LongVA-7B',
         'pin_memory': True,
         'kv_repr': kv_repr,
         'q_repr': q_repr,
+        'q_token_agg': q_token_agg,
+        'q_topk_ratio': q_topk_ratio,
+        'k_token_agg': k_token_agg,
+        'k_topk_ratio': k_topk_ratio,
+        'head_specific_retrieval': head_specific_retrieval,
     }
     model = LongVA_ReKV.from_pretrained(
         model_path, 

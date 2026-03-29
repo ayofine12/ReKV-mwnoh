@@ -44,6 +44,7 @@ Our setup: Ubuntu 22.04, CUDA 12.6, 8x Nvidia H800 (80GB)
   - [ActivityNet-QA](https://huggingface.co/datasets/lmms-lab/ActivityNetQA)
   - [RVS](https://huggingface.co/datasets/Becomebright/RVS)
   - [CGBench](https://huggingface.co/datasets/CG-Bench/CG-Bench)
+  - [NExT-QA](https://github.com/doc-doc/NExT-QA) with raw videos from NExTVideo
   - The `data/` folder should be arranged as:
     ```
     data
@@ -59,6 +60,9 @@ Our setup: Ubuntu 22.04, CUDA 12.6, 8x Nvidia H800 (80GB)
     ├── mlvu
     │   ├── dev_debug_mc.json
     │   └── videos
+    ├── nextqa
+    │   ├── test.json
+    │   └── val.json
     ├── qaego4d
     │   ├── test_mc.json
     │   └── videos
@@ -70,6 +74,12 @@ Our setup: Ubuntu 22.04, CUDA 12.6, 8x Nvidia H800 (80GB)
             ├── movienet_oe.json
             └── videos
     ```
+- If you already have `NExT-QA` and `NExTVideo` locally, convert them into ReKV annotations with:
+  ```bash
+  python tools/prepare_nextqa.py \
+      --nextqa-root /mnt/ssd1/mwnoh/NExT-QA \
+      --nextvideo-root /mnt/ssd1/mwnoh/NExTVideo
+  ```
 - Increases the memory map limit for processes (needed for offloading KV-Caches): `sudo sysctl -w vm.max_map_count=262144`
 
 ## Evaluation
@@ -83,7 +93,7 @@ num_chunks=8
 # Supported model: llava_ov_0.5b llava_ov_7b llava_ov_72b video_llava_7b longva_7b
 model=llava_ov_0.5b
 
-# Supported dataset: qaego4d egoschema cgbench mlvu activitynet_qa rvs_ego rvs_movie
+# Supported dataset: qaego4d egoschema cgbench mlvu activitynet_qa rvs_ego rvs_movie nextqa
 # MLVU has an extremely long video (~9hr). Remove it in the annotation file if your system doesn't have enough RAM.
 dataset=qaego4d
 

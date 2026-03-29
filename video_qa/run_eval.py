@@ -250,7 +250,6 @@ def eval_cgbench(args):
     # eval
     exec(f"python video_qa/eval/eval_multiple_choice.py --save_dir {save_dir}")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="llava_ov_7b", choices=['llava_ov_0.5b', 'llava_ov_7b', 'llava_ov_72b', 'video_llava_7b', 'longva_7b'])
