@@ -119,6 +119,7 @@ class BaseVQA:
         self.save_dir = save_dir
         self.choice_letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
         self.record = {(self.retrieve_size, self.chunk_size): []}
+        self.completed_questions = self._load_completed_questions()
 
     def split_list(self, lst, n):
         """Split a list into n (roughly) equal-sized chunks"""
@@ -193,7 +194,7 @@ class BaseVQA:
 
     def save_result_to_csv(self, result_dict):
         """Save a single result to CSV file by appending"""
-        csv_path = f'{self.save_dir}/{self.retrieval_tag}/n{self.n_local}/{self.retrieval_tag}_rs{self.retrieve_size}_cs{self.chunk_size}_n{self.n_local}_accuracy.csv'
+        csv_path = self.get_result_csv_path()
         
         # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
@@ -203,12 +204,63 @@ class BaseVQA:
         # Check if file exists to determine if we need to write header
         file_exists = os.path.exists(csv_path)
         df.to_csv(csv_path, mode='a', header=not file_exists, index=False)
+        self.mark_question_completed(result_dict)
+
+    def get_result_csv_path(self):
+        return f'{self.save_dir}/{self.retrieval_tag}/n{self.n_local}/{self.retrieval_tag}_rs{self.retrieve_size}_cs{self.chunk_size}_n{self.n_local}_accuracy.csv'
+
+    def _result_key_columns(self, df):
+        if 'question_idx' in df.columns:
+            return 'question_idx'
+        if 'question' in df.columns:
+            return 'question'
+        return None
+
+    def _load_completed_questions(self):
+        csv_path = self.get_result_csv_path()
+        if not os.path.exists(csv_path):
+            return {}
+
+        df = pd.read_csv(csv_path)
+        if df.empty or 'video_id' not in df.columns:
+            return {}
+
+        key_column = self._result_key_columns(df)
+        if key_column is None:
+            return {}
+
+        completed = {}
+        for _, row in df[['video_id', key_column]].dropna().iterrows():
+            video_id = str(row['video_id'])
+            question_key = str(row[key_column])
+            completed.setdefault(video_id, set()).add(question_key)
+        logger.info(f'Loaded {sum(len(v) for v in completed.values())} completed questions from {csv_path}')
+        return completed
+
+    def get_completed_questions(self, video_id):
+        return self.completed_questions.get(str(video_id), set())
+
+    def is_question_completed(self, video_id, question_key):
+        if question_key is None:
+            return False
+        return str(question_key) in self.get_completed_questions(video_id)
+
+    def mark_question_completed(self, result_dict):
+        video_id = result_dict.get('video_id')
+        question_key = result_dict.get('question_idx', result_dict.get('question'))
+        if video_id is None or question_key is None:
+            return
+        self.completed_questions.setdefault(str(video_id), set()).add(str(question_key))
 
     def analyze(self, debug=False):
         video_annos = self.anno[:1] if debug else self.anno
         for video_sample in tqdm(video_annos):
             logger.debug(f'video_id: {video_sample["video_id"]}')
             self.analyze_a_video(video_sample)
+
+        if not any(self.record.values()):
+            logger.info('No new results were generated in this run.')
+            return
 
         dfs = []
         for (retrieve_size, chunk_size), dict_list in self.record.items():

@@ -12,7 +12,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 SAMPLE_FPS="${SAMPLE_FPS:-1}"
 SAVE_DIR="${SAVE_DIR:-/mnt/ssd1/mwnoh/LVBench/results}"
-ANNO_PATH="${ANNO_PATH:-/mnt/ssd1/mwnoh/LVBench/data/usable_entity.json}"
+ANNO_PATH="${ANNO_PATH:-/mnt/ssd1/mwnoh/LVBench/data/entity.json}"
 MODEL="${MODEL:-llava_ov_7b}"
 N_LOCAL="${N_LOCAL:-6272}"
 RETRIEVE_SIZE="${RETRIEVE_SIZE:-32}"
@@ -23,6 +23,8 @@ DEBUG_MODE="${DEBUG_MODE:-True}"
 
 HEAD_SPECIFIC_FILTER="${HEAD_SPECIFIC_FILTER:-all}"   # all|true|false
 RUN_TAG_FILTER="${RUN_TAG_FILTER:-}"                 # substring filter, optional
+START_TAG="${START_TAG:-}"                           # exact tag to start from, optional
+START_HEAD_SPECIFIC="${START_HEAD_SPECIFIC:-}"       # True|False, optional
 
 BASE_ARGS=(
   --sample_fps "${SAMPLE_FPS}"
@@ -70,6 +72,25 @@ should_run_tag() {
   [[ "${tag}" == *"${RUN_TAG_FILTER}"* ]]
 }
 
+should_start_at() {
+  local tag="$1"
+  local head_specific="$2"
+
+  if [[ -z "${START_TAG}" ]]; then
+    return 0
+  fi
+
+  if [[ "${tag}" != "${START_TAG}" ]]; then
+    return 1
+  fi
+
+  if [[ -z "${START_HEAD_SPECIFIC}" ]]; then
+    return 0
+  fi
+
+  [[ "${head_specific}" == "${START_HEAD_SPECIFIC}" ]]
+}
+
 run_one() {
   local tag="$1"
   local head_specific="$2"
@@ -95,12 +116,24 @@ run_one() {
   )
 }
 
+start_reached=0
+
 for run_spec in "${RUNS[@]}"; do
   tag="${run_spec%%::*}"
   arg_string="${run_spec#*::}"
   read -r -a run_args <<< "${arg_string}"
 
-  run_one "${tag}" "False" "${run_args[@]}"
-  run_one "${tag}" "True" "${run_args[@]}"
-done
+  if [[ "${start_reached}" -eq 0 ]] && should_start_at "${tag}" "False"; then
+    start_reached=1
+  fi
+  if [[ "${start_reached}" -eq 1 ]]; then
+    run_one "${tag}" "False" "${run_args[@]}"
+  fi
 
+  if [[ "${start_reached}" -eq 0 ]] && should_start_at "${tag}" "True"; then
+    start_reached=1
+  fi
+  if [[ "${start_reached}" -eq 1 ]]; then
+    run_one "${tag}" "True" "${run_args[@]}"
+  fi
+done

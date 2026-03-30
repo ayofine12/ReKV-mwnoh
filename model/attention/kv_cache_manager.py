@@ -279,12 +279,16 @@ class HeadVectorTensor:
             return sim.topk(keep, dim=-1).values.mean(dim=-1)
         raise ValueError(f"Unsupported agg: {agg}. Choose from {{'mean', 'topk'}}.")
 
-    def get_head_similarity_token_q(self, query_tokens: torch.Tensor, agg: str = "topk", topk_count: Optional[int] = None):
+    def get_head_similarity_token_q(self, query_tokens: torch.Tensor, agg: str = "topk", topk_count: Optional[int] = None,
+                                    k_agg: str = "max", k_topk_count: Optional[int] = None):
         assert query_tokens.dim() == 3
         assert query_tokens.size(0) == self.num_heads_kv
         assert query_tokens.size(2) == self.dim_head
         if self.length == 0:
             return torch.empty((self.num_heads_kv, 0), device=self.data.device, dtype=torch.float32)
+
+        if k_agg not in {"max", "topk"}:
+            raise ValueError(f"Unsupported k_agg: {k_agg}. Choose from {{'max', 'topk'}}.")
 
         key = self.data[:self.length].float()  # (n_block, n_head_kv, dim_head)
         query = query_tokens.float()  # (n_head_kv, q_len, dim_head)
