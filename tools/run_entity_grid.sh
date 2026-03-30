@@ -41,7 +41,6 @@ BASE_ARGS=(
 
 RUNS=(
   "mean_mean::--kv_repr mean --q_repr mean"
-  "mean_token_qmean::--kv_repr mean --q_repr token --q_token_agg mean"
   "mean_token_qtopk::--kv_repr mean --q_repr token --q_token_agg topk --q_topk_ratio 0.3"
   "token_mean_kmax::--kv_repr token --q_repr mean --k_token_agg max"
   "token_mean_ktopk::--kv_repr token --q_repr mean --k_token_agg topk --k_topk_ratio 0.1"
