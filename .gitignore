@@ -31,3 +31,4 @@ model_zoo/*
 results/*
 !results/.gitkeep
 !tools/run_entity_grid.sh
+!tools/run_event_grid.sh
