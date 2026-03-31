@@ -99,6 +99,7 @@ class ReKVOfflineVQA(BaseVQA):
         video_id = video_sample['video_id']
         dataset_name = video_sample.get('dataset', 'qaego4d')
         video_path = self.resolve_video_path(video_sample)
+        logger.debug(f'Resolved video path for {video_id}: {video_path}')
         
         # Check cache first
         cache_dir = os.environ.get('REKV_VIDEO_CACHE_DIR', f'/tmp/rekv_video_cache/{dataset_name}')

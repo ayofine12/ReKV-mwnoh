@@ -544,6 +544,9 @@ class ContextManager:
                  k_token_agg: str = "max",
                  k_topk_ratio: float = 0.3,
                  head_specific_retrieval: bool = False,
+                 retrieval_fusion: str = "none",
+                 fusion_mean_topk: Optional[int] = None,
+                 fusion_token_topk: Optional[int] = None,
                  fattn: bool = False,
                  async_global_stream: bool = False,
                  pin_memory: bool = False,
@@ -566,6 +569,16 @@ class ContextManager:
         self.k_token_agg = k_token_agg
         self.k_topk_ratio = k_topk_ratio
         self.head_specific_retrieval = head_specific_retrieval
+        self.retrieval_fusion = retrieval_fusion
+        if fusion_mean_topk is None and fusion_token_topk is None:
+            fusion_mean_topk = topk // 2
+            fusion_token_topk = topk - fusion_mean_topk
+        elif fusion_mean_topk is None:
+            fusion_mean_topk = topk - fusion_token_topk
+        elif fusion_token_topk is None:
+            fusion_token_topk = topk - fusion_mean_topk
+        self.fusion_mean_topk = fusion_mean_topk
+        self.fusion_token_topk = fusion_token_topk
         if self.kv_repr not in {"mean", "token"}:
             raise ValueError(f"Unsupported kv_repr: {self.kv_repr}. Choose from {{'mean', 'token'}}.")
         if self.q_repr not in {"mean", "token"}:
@@ -578,6 +591,18 @@ class ContextManager:
             raise ValueError(f"Unsupported k_token_agg: {self.k_token_agg}. Choose from {{'max', 'topk'}}.")
         if not (0 < self.k_topk_ratio <= 1):
             raise ValueError(f"Unsupported k_topk_ratio: {self.k_topk_ratio}. It must be in (0, 1].")
+        if self.retrieval_fusion not in {"none", "quota"}:
+            raise ValueError(
+                f"Unsupported retrieval_fusion: {self.retrieval_fusion}. Choose from {{'none', 'quota'}}."
+            )
+        if self.retrieval_fusion != "none":
+            if self.fusion_mean_topk < 0 or self.fusion_token_topk < 0:
+                raise ValueError("fusion_mean_topk and fusion_token_topk must be non-negative.")
+            if self.fusion_mean_topk + self.fusion_token_topk != self.topk:
+                raise ValueError(
+                    f"fusion_mean_topk + fusion_token_topk must equal topk: "
+                    f"{self.fusion_mean_topk} + {self.fusion_token_topk} != {self.topk}"
+                )
         self.Attn, _ = get_multi_stage_dot_production_attention(fattn)
         self.fattn = fattn
         self.initialized = False
@@ -589,6 +614,313 @@ class ContextManager:
             GLOBAL_STREAM = torch.cuda.Stream()
 
         self.reset_retrieval()
+
+    def _required_cached_blocks_per_unit(self):
+        # Head-specific retrieval can request up to topk distinct blocks per KV head.
+        # Size the GPU cache for that worst case so loading selected blocks cannot
+        # exhaust the pool before LRU eviction has a chance to run.
+        if self._use_head_specific_retrieval():
+            return max(self.max_cached_block, self.topk * self.num_heads_kv)
+        return max(self.max_cached_block, self.topk)
+
+    def _build_block_storage(self, kv_repr: str, element_dtype, device):
+        if kv_repr == "mean":
+            return [
+                HeadVectorTensor(self.num_heads_kv, self.dim_head, element_dtype, device)
+                for _ in range(self.num_units)
+            ]
+        return [
+            HeadBlockTokenTensor(
+                self.num_heads_kv,
+                self.block_size,
+                self.dim_head,
+                element_dtype,
+                device,
+            )
+            for _ in range(self.num_units)
+        ]
+
+    def _append_block_representations(self, global_block_k: torch.Tensor):
+        if self.retrieval_fusion != "none":
+            mean_block_k = global_block_k.mean(dim=-2, keepdim=False).contiguous()
+            token_block_k = global_block_k.contiguous()
+            for u in range(self.num_units):
+                self.block_k_mean[u].append(mean_block_k[u:u + 1])
+                self.block_k_token[u].append(token_block_k[u:u + 1])
+            return
+
+        if self.kv_repr == "mean":
+            global_block_k = global_block_k.mean(dim=-2, keepdim=False).contiguous()
+        else:
+            global_block_k = global_block_k.contiguous()
+        for u in range(self.num_units):
+            self.block_k[u].append(global_block_k[u:u + 1])
+
+    def _get_q_token_topk_for_ratio(self, q_len: int, ratio: float) -> int:
+        return max(1, math.ceil(ratio * q_len))
+
+    def _get_k_token_topk_for_ratio(self, k_len: int, ratio: float) -> int:
+        return max(1, math.ceil(ratio * k_len))
+
+    def _compute_logits_from_block_k(
+        self,
+        block_k,
+        global_h_q,
+        kv_repr: str,
+        q_repr: str,
+        q_token_agg: str,
+        q_topk_ratio: float,
+        k_token_agg: str,
+        k_topk_ratio: float,
+    ):
+        q_len = global_h_q.size(2)
+        query_group_reduction = "mean" if self._use_head_specific_retrieval() else "sum"
+        if q_repr == "mean":
+            global_h_q = global_h_q.mean(dim=2, keepdim=False)
+            global_h_q = self._group_query_heads(global_h_q, reduction=query_group_reduction)
+        else:
+            global_h_q = self._group_query_heads(global_h_q, reduction=query_group_reduction)
+
+        if q_repr == "mean":
+            if kv_repr == "mean":
+                if self._use_head_specific_retrieval():
+                    logits = torch.stack([
+                        block_k[u].get_head_similarity_mean_q(global_h_q[u])
+                        for u in range(self.num_units)
+                    ])  # (batch_size, num_heads_kv, block_num)
+                else:
+                    logits = torch.stack([
+                        block_k[u].get_head_similarity_mean_q(global_h_q[u]).sum(dim=0)
+                        for u in range(self.num_units)
+                    ])  # (batch_size, block_num)
+            else:
+                logits = torch.stack([
+                    block_k[u].get_head_similarity_mean_q(
+                        global_h_q[u],
+                        k_agg=k_token_agg,
+                        k_topk_count=self._get_k_token_topk_for_ratio(self.block_size, k_topk_ratio)
+                        if k_token_agg == "topk" else None,
+                    )
+                    for u in range(self.num_units)
+                ])  # (batch_size, num_heads_kv, block_num)
+                if not self._use_head_specific_retrieval():
+                    logits = logits.sum(dim=1)  # (batch_size, block_num)
+        else:
+            if kv_repr == "mean":
+                if self._use_head_specific_retrieval():
+                    logits = torch.stack([
+                        block_k[u].get_head_similarity_token_q(
+                            global_h_q[u],
+                            agg=q_token_agg,
+                            topk_count=self._get_q_token_topk_for_ratio(q_len, q_topk_ratio) if q_token_agg == "topk" else None,
+                            k_agg=k_token_agg,
+                            k_topk_count=self._get_k_token_topk_for_ratio(self.block_size, k_topk_ratio)
+                            if k_token_agg == "topk" else None,
+                        )
+                        for u in range(self.num_units)
+                    ])  # (batch_size, num_heads_kv, block_num)
+                else:
+                    logits = torch.stack([
+                        (
+                            block_k[u].get_per_head_token_scores(global_h_q[u]).sum(dim=0).mean(dim=-1)
+                            if q_token_agg == "mean"
+                            else block_k[u].get_per_head_token_scores(global_h_q[u]).sum(dim=0).topk(
+                                max(1, min(self._get_q_token_topk_for_ratio(q_len, q_topk_ratio), q_len)), dim=-1
+                            ).values.mean(dim=-1)
+                        )
+                        for u in range(self.num_units)
+                    ])  # (batch_size, block_num)
+            else:
+                if self._use_head_specific_retrieval():
+                    logits = torch.stack([
+                        block_k[u].get_head_similarity_token_q(
+                            global_h_q[u],
+                            agg=q_token_agg,
+                            topk_count=self._get_q_token_topk_for_ratio(q_len, q_topk_ratio) if q_token_agg == "topk" else None,
+                            k_agg=k_token_agg,
+                            k_topk_count=self._get_k_token_topk_for_ratio(self.block_size, k_topk_ratio)
+                            if k_token_agg == "topk" else None,
+                        )
+                        for u in range(self.num_units)
+                    ])  # (batch_size, num_heads_kv, block_num)
+                else:
+                    logits = torch.stack([
+                        (
+                            block_k[u].get_per_head_token_scores(
+                                global_h_q[u],
+                                k_agg=k_token_agg,
+                                k_topk_count=self._get_k_token_topk_for_ratio(self.block_size, k_topk_ratio)
+                                if k_token_agg == "topk" else None,
+                            ).sum(dim=0).mean(dim=-1)
+                            if q_token_agg == "mean"
+                            else block_k[u].get_per_head_token_scores(
+                                global_h_q[u],
+                                k_agg=k_token_agg,
+                                k_topk_count=self._get_k_token_topk_for_ratio(self.block_size, k_topk_ratio)
+                                if k_token_agg == "topk" else None,
+                            ).sum(dim=0).topk(
+                                max(1, min(self._get_q_token_topk_for_ratio(q_len, q_topk_ratio), q_len)), dim=-1
+                            ).values.mean(dim=-1)
+                        )
+                        for u in range(self.num_units)
+                    ])  # (batch_size, block_num)
+        return logits
+
+    def _rank_blocks_from_logits(self, logits: torch.Tensor):
+        rankings = []
+        for u in range(self.num_units):
+            unit_logits = logits[u]
+            if unit_logits.dim() == 1:
+                unit_logits = unit_logits.unsqueeze(0)
+                unwrap_head = True
+            else:
+                unwrap_head = False
+
+            unit_rankings = []
+            for head_logits in unit_logits:
+                remainder_size = head_logits.shape[-1] % self.chunk_size
+                prefix_len = head_logits.shape[-1] - remainder_size
+                if prefix_len > 0:
+                    chunked_logits = head_logits[:prefix_len].reshape(-1, self.chunk_size).mean(dim=-1)
+                else:
+                    chunked_logits = head_logits.new_empty((0,))
+                if remainder_size > 0:
+                    remainder_logits = head_logits[-remainder_size:].mean(dim=-1, keepdim=True)
+                    chunked_logits = torch.cat([chunked_logits, remainder_logits], dim=0)
+                ranked_chunks = chunked_logits.argsort(dim=0, descending=True).tolist()
+                ranked_blocks = []
+                for chunk_idx in ranked_chunks:
+                    start = chunk_idx * self.chunk_size
+                    ranked_blocks.extend([
+                        idx for idx in range(start, start + self.chunk_size) if idx < head_logits.shape[-1]
+                    ])
+                unit_rankings.append(ranked_blocks)
+            rankings.append(unit_rankings[0] if unwrap_head else unit_rankings)
+        return rankings
+
+    def _pick_next_unseen(self, ranked_indices, ptr, seen):
+        while ptr < len(ranked_indices):
+            block_idx = ranked_indices[ptr]
+            ptr += 1
+            if block_idx not in seen:
+                return block_idx, ptr
+        return None, ptr
+
+    def _select_branch(self, mean_count, token_count):
+        if mean_count >= self.fusion_mean_topk:
+            return "token"
+        if token_count >= self.fusion_token_topk:
+            return "mean"
+        mean_progress = mean_count / self.fusion_mean_topk if self.fusion_mean_topk > 0 else 1.0
+        token_progress = token_count / self.fusion_token_topk if self.fusion_token_topk > 0 else 1.0
+        return "mean" if mean_progress <= token_progress else "token"
+
+    def _fuse_ranked_block_indices(self, mean_rankings, token_rankings):
+        fused = []
+        for u in range(self.num_units):
+            if self._use_head_specific_retrieval():
+                unit_fused = []
+                for h in range(self.num_heads_kv):
+                    selected = []
+                    seen = set()
+                    mean_ptr = 0
+                    token_ptr = 0
+                    mean_count = 0
+                    token_count = 0
+                    mean_head_rank = mean_rankings[u][h]
+                    token_head_rank = token_rankings[u][h]
+
+                    while len(selected) < self.topk and (mean_ptr < len(mean_head_rank) or token_ptr < len(token_head_rank)):
+                        branch = self._select_branch(mean_count, token_count)
+                        if branch == "mean":
+                            block_idx, mean_ptr = self._pick_next_unseen(mean_head_rank, mean_ptr, seen)
+                            if block_idx is None:
+                                branch = "token"
+                            else:
+                                selected.append(block_idx)
+                                seen.add(block_idx)
+                                mean_count += 1
+                                continue
+                        block_idx, token_ptr = self._pick_next_unseen(token_head_rank, token_ptr, seen)
+                        if block_idx is None:
+                            block_idx, mean_ptr = self._pick_next_unseen(mean_head_rank, mean_ptr, seen)
+                            if block_idx is None:
+                                break
+                            selected.append(block_idx)
+                            seen.add(block_idx)
+                            mean_count += 1
+                        else:
+                            selected.append(block_idx)
+                            seen.add(block_idx)
+                            token_count += 1
+                    unit_fused.append(sorted(selected))
+                fused.append(unit_fused)
+                continue
+
+            selected = []
+            seen = set()
+            mean_ptr = 0
+            token_ptr = 0
+            mean_count = 0
+            token_count = 0
+
+            while len(selected) < self.topk and (mean_ptr < len(mean_rankings[u]) or token_ptr < len(token_rankings[u])):
+                branch = self._select_branch(mean_count, token_count)
+                if branch == "mean":
+                    block_idx, mean_ptr = self._pick_next_unseen(mean_rankings[u], mean_ptr, seen)
+                    if block_idx is None:
+                        branch = "token"
+                    else:
+                        selected.append(block_idx)
+                        seen.add(block_idx)
+                        mean_count += 1
+                        continue
+                block_idx, token_ptr = self._pick_next_unseen(token_rankings[u], token_ptr, seen)
+                if block_idx is None:
+                    block_idx, mean_ptr = self._pick_next_unseen(mean_rankings[u], mean_ptr, seen)
+                    if block_idx is None:
+                        break
+                    selected.append(block_idx)
+                    seen.add(block_idx)
+                    mean_count += 1
+                else:
+                    selected.append(block_idx)
+                    seen.add(block_idx)
+                    token_count += 1
+
+            fused.append(sorted(selected))
+        return fused
+
+    def _calc_hybrid_block_topk(self, global_h_q):
+        if self.num_global_block <= self.topk:
+            if self._use_head_specific_retrieval():
+                return [[list(range(self.num_global_block)) for _ in range(self.num_heads_kv)] for _ in range(self.num_units)]
+            return [list(range(self.num_global_block)) for _ in range(self.num_units)]
+
+        mean_logits = self._compute_logits_from_block_k(
+            self.block_k_mean,
+            global_h_q,
+            kv_repr="mean",
+            q_repr="mean",
+            q_token_agg="mean",
+            q_topk_ratio=1.0,
+            k_token_agg="max",
+            k_topk_ratio=1.0,
+        )
+        token_logits = self._compute_logits_from_block_k(
+            self.block_k_token,
+            global_h_q,
+            kv_repr="token",
+            q_repr="token",
+            q_token_agg=self.q_token_agg,
+            q_topk_ratio=self.q_topk_ratio,
+            k_token_agg=self.k_token_agg,
+            k_topk_ratio=self.k_topk_ratio,
+        )
+        self.similarity = {"mean": mean_logits, "token": token_logits}
+        mean_rankings = self._rank_blocks_from_logits(mean_logits)
+        token_rankings = self._rank_blocks_from_logits(token_logits)
+        return self._fuse_ranked_block_indices(mean_rankings, token_rankings)
 
     def _remove_lru_blocks(self, u, num_remove: Optional[int] = None, ignore_blocks = None):
         if num_remove is None:
@@ -678,7 +1010,11 @@ class ContextManager:
         self.num_global_block = 0
 
         # context memory's representative keys: batch_size x (n_blocks, hidden_dim)
-        if self.kv_repr == "mean":
+        if self.retrieval_fusion != "none":
+            self.block_k_mean = self._build_block_storage("mean", global_k.dtype, global_k.device)
+            self.block_k_token = self._build_block_storage("token", global_k.dtype, global_k.device)
+            self.block_k = self.block_k_token
+        elif self.kv_repr == "mean":
             self.block_k = [HeadVectorTensor(
                 self.num_heads_kv, dim_head, global_k.dtype, global_k.device
             ) for _ in range(self.num_units)]
@@ -722,6 +1058,7 @@ class ContextManager:
             )
         self.global_buffer_init_st = 0
         self.global_buffer_init_ed = 0
+        self.max_cached_block = self._required_cached_blocks_per_unit()
         self.cuda_cache = CudaCache(
             self.max_cached_block * self.num_units,
             self.unit_size_kv * self.block_size * dim_head * 2,
@@ -900,6 +1237,9 @@ class ContextManager:
     def _calc_block_topk(
         self, global_h_q
     ):
+        if self.retrieval_fusion != "none":
+            return self._calc_hybrid_block_topk(global_h_q)
+
         q_len = global_h_q.size(2)
         query_group_reduction = "mean" if self._use_head_specific_retrieval() else "sum"
         if self.q_repr == "mean":
@@ -1227,20 +1567,17 @@ class ContextManager:
                     ))
 
                 global_block_k = self.global_remainder[0][:, :, global_remainder_st:global_remainder_st + self.block_size, :]
-                if self.kv_repr == "mean":
-                    global_block_k = global_block_k.mean(dim=-2, keepdim=False).contiguous()  # (batch_size, num_heads_kv, dim_head)
-                elif self.kv_repr == "token":
-                    global_block_k = global_block_k.contiguous()  # (batch_size, num_heads_kv, block_size, dim_head)
+                if self.retrieval_fusion != "none":
+                    self._append_block_representations(global_block_k)
+                elif self.kv_repr in {"mean", "token"}:
+                    self._append_block_representations(global_block_k)
                 else:
                     global_block_k = self._from_group_kv(global_block_k)  # (batch_size, num_heads, length, dim_head)
                     global_block_k = global_block_k.transpose(1, 2).contiguous().reshape(
                         self.num_units, self.block_size, self.unit_size * self.dim_head
                     )  # (batch_size, block_size, num_heads * dim_head)
                     global_block_k = global_block_k.contiguous()
-                for u in range(self.num_units):
-                    if self.kv_repr == "mean":
-                        self.block_k[u].append(global_block_k[u:u+1])
-                    else:
+                    for u in range(self.num_units):
                         self.block_k[u].append(global_block_k[u:u+1])
                 
                 self.num_global_block += 1

@@ -32,3 +32,6 @@ results/*
 !results/.gitkeep
 !tools/run_entity_grid.sh
 !tools/run_event_grid.sh
+!tools/run_reasoning_grid.sh
+!tools/run_hybrid.sh
+!tools/run_mean.sh

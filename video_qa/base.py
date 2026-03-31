@@ -60,7 +60,8 @@ class BaseVQA:
                  n_local=15000, kv_repr="mean", q_repr="mean",
                  q_token_agg="topk", q_topk_ratio=0.3,
                  k_token_agg="max", k_topk_ratio=0.3,
-                 head_specific_retrieval=False, use_video_cache=True) -> None:
+                 head_specific_retrieval=False, use_video_cache=True,
+                 retrieval_fusion="none", fusion_mean_topk=None, fusion_token_topk=None) -> None:
         
         self.sample_fps = sample_fps
         self.use_video_cache = use_video_cache
@@ -81,8 +82,31 @@ class BaseVQA:
         self.k_token_agg = k_token_agg
         self.k_topk_ratio = k_topk_ratio
         self.head_specific_retrieval = head_specific_retrieval
+        self.retrieval_fusion = retrieval_fusion
+        if fusion_mean_topk is None and fusion_token_topk is None:
+            fusion_mean_topk = retrieve_size // 2
+            fusion_token_topk = retrieve_size - fusion_mean_topk
+        elif fusion_mean_topk is None:
+            fusion_mean_topk = retrieve_size - fusion_token_topk
+        elif fusion_token_topk is None:
+            fusion_token_topk = retrieve_size - fusion_mean_topk
+        self.fusion_mean_topk = fusion_mean_topk
+        self.fusion_token_topk = fusion_token_topk
 
-        if kv_repr == "mean":
+        if self.retrieval_fusion != "none":
+            assert self.fusion_mean_topk + self.fusion_token_topk == self.retrieve_size, (
+                f'fusion_mean_topk + fusion_token_topk must equal retrieve_size: '
+                f'{self.fusion_mean_topk} + {self.fusion_token_topk} != {self.retrieve_size}'
+            )
+
+        if self.retrieval_fusion != "none":
+            self.retrieval_tag = (
+                f'head_specific_{head_specific_retrieval}-fusion_{self.retrieval_fusion}'
+                f'-mean_topk_{self.fusion_mean_topk}-token_topk_{self.fusion_token_topk}'
+                f'-token_qagg_{q_token_agg}-qtopk_{q_topk_ratio}'
+                f'-kagg_{k_token_agg}-ktopk_{k_topk_ratio}'
+            )
+        elif kv_repr == "mean":
             if q_repr == "mean":
                 self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}'
             else:
@@ -131,11 +155,37 @@ class BaseVQA:
         return chunks[k]
 
     def load_video(self, video_path):
-        vr = VideoReader(video_path, ctx=cpu(0))
+        resolved_video_path = os.path.abspath(os.path.expanduser(str(video_path)))
+        if resolved_video_path.endswith('.npy'):
+            video = np.load(resolved_video_path)
+            logger.debug(f'loaded numpy video from {resolved_video_path} with shape {video.shape}')
+            return video
+
+        if not os.path.exists(resolved_video_path):
+            raise FileNotFoundError(
+                f'Video file not found: {resolved_video_path} '
+                f'(original={video_path}, cwd={os.getcwd()})'
+            )
+
+        if not os.path.isfile(resolved_video_path):
+            raise RuntimeError(
+                f'Video path is not a file: {resolved_video_path} '
+                f'(original={video_path})'
+            )
+
+        try:
+            vr = VideoReader(resolved_video_path, ctx=cpu(0), num_threads=1)
+        except Exception as exc:
+            file_size = os.path.getsize(resolved_video_path)
+            raise RuntimeError(
+                f'Failed to open video with decord: {resolved_video_path} '
+                f'(original={video_path}, size_bytes={file_size}, cwd={os.getcwd()})'
+            ) from exc
+
         fps = round(vr.get_avg_fps())
         frame_idx = [i for i in range(0, len(vr), int(fps / self.sample_fps))]
         video = vr.get_batch(frame_idx).asnumpy()
-        logger.debug(f'video shape: {video.shape}')
+        logger.debug(f'video shape: {video.shape} from {resolved_video_path}')
         return video
     
     def calc_recall_precision(self, gt_temporal_windows, retrieved_mask):
@@ -303,6 +353,9 @@ def work(QA_CLASS):
     parser.add_argument("--k_token_agg", type=str, default="max", choices=["max", "topk"])
     parser.add_argument("--k_topk_ratio", type=float, default=0.3)
     parser.add_argument("--head_specific_retrieval", type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument("--retrieval_fusion", type=str, default="none", choices=["none", "quota"])
+    parser.add_argument("--fusion_mean_topk", type=int, default=None)
+    parser.add_argument("--fusion_token_topk", type=int, default=None)
     parser.add_argument("--use_video_cache", type=str2bool, nargs='?', const=True, default=True)
     parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True)
     args = parser.parse_args()
@@ -333,6 +386,9 @@ def work(QA_CLASS):
         k_token_agg=args.k_token_agg,
         k_topk_ratio=args.k_topk_ratio,
         head_specific_retrieval=args.head_specific_retrieval,
+        retrieval_fusion=args.retrieval_fusion,
+        fusion_mean_topk=args.fusion_mean_topk,
+        fusion_token_topk=args.fusion_token_topk,
     )
 
     # Load ground truth file
@@ -354,6 +410,9 @@ def work(QA_CLASS):
         k_token_agg=args.k_token_agg,
         k_topk_ratio=args.k_topk_ratio,
         head_specific_retrieval=args.head_specific_retrieval,
+        retrieval_fusion=args.retrieval_fusion,
+        fusion_mean_topk=args.fusion_mean_topk,
+        fusion_token_topk=args.fusion_token_topk,
         use_video_cache=args.use_video_cache,
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,
