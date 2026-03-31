@@ -35,3 +35,4 @@ results/*
 !tools/run_reasoning_grid.sh
 !tools/run_hybrid.sh
 !tools/run_mean.sh
+!tools/run_token.sh
