@@ -8,7 +8,7 @@ PROGRAM="${PROJECT_ROOT}/video_qa/rekv_offline_vqa.py"
 
 export REKV_VIDEO_CACHE_DIR="${REKV_VIDEO_CACHE_DIR:-/mnt/ssd1/mwnoh/LVBench/video_cache}"
 export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/model:${PROJECT_ROOT}/model/longva:${PYTHONPATH:-}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 SAMPLE_FPS="${SAMPLE_FPS:-1}"
 SAVE_DIR="${SAVE_DIR:-/mnt/ssd1/mwnoh/LVBench/results/retrieval_mean}"
@@ -20,7 +20,7 @@ RETRIEVAL_FUSION="${RETRIEVAL_FUSION:-none}"
 RETRIEVE_CHUNK_SIZE="${RETRIEVE_CHUNK_SIZE:-1}"
 ENCODE_CHUNK_SIZE="${ENCODE_CHUNK_SIZE:-8}"
 USE_VIDEO_CACHE="${USE_VIDEO_CACHE:-True}"
-DEBUG_MODE="${DEBUG_MODE:-True}"
+DEBUG_MODE="${DEBUG_MODE:-False}"
 
 HEAD_SPECIFIC_FILTER="${HEAD_SPECIFIC_FILTER:-true}"  # all|true|false
 RUN_TAG_FILTER="${RUN_TAG_FILTER:-}"                 # substring filter, optional
