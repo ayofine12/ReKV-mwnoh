@@ -6,6 +6,7 @@ from flash_vstream import VStreamLlamaForCausalLM
 
 from model.patch import patch_hf
 from model.abstract_rekv import Abstract_ReKV
+from model.profiling import profile_phase, profile_section
 
 
 class FlashVStream_ReKV(VStreamLlamaForCausalLM, Abstract_ReKV):

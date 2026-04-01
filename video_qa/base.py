@@ -18,6 +18,7 @@ import logzero
 from logzero import logger
 
 from model import llava_onevision_rekv, video_llava_rekv, longva_rekv
+from model.profiling import configure_profiling, get_profiler
 
 
 MODELS = {
@@ -61,7 +62,8 @@ class BaseVQA:
                  q_token_agg="topk", q_topk_ratio=0.3,
                  k_token_agg="max", k_topk_ratio=0.3,
                  head_specific_retrieval=False, use_video_cache=True,
-                 retrieval_fusion="none", fusion_mean_topk=None, fusion_token_topk=None) -> None:
+                 retrieval_fusion="none", fusion_mean_topk=None, fusion_token_topk=None,
+                 profile_video_ids=None) -> None:
         
         self.sample_fps = sample_fps
         self.use_video_cache = use_video_cache
@@ -144,6 +146,22 @@ class BaseVQA:
         self.choice_letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
         self.record = {(self.retrieve_size, self.chunk_size): []}
         self.completed_questions = self._load_completed_questions()
+        self.profile_video_ids = set(profile_video_ids or [])
+        profiler = get_profiler()
+        if profiler.is_enabled():
+            profiler.update_metadata(
+                save_dir=self.save_dir,
+                retrieval_tag=self.retrieval_tag,
+                retrieve_size=self.retrieve_size,
+                chunk_size=self.chunk_size,
+                n_local=self.n_local,
+                kv_repr=self.kv_repr,
+                q_repr=self.q_repr,
+                retrieval_fusion=self.retrieval_fusion,
+                head_specific_retrieval=self.head_specific_retrieval,
+            )
+            if not self.profile_video_ids:
+                profiler.configure(output_path=self.get_profile_json_path())
 
     def split_list(self, lst, n):
         """Split a list into n (roughly) equal-sized chunks"""
@@ -259,6 +277,21 @@ class BaseVQA:
     def get_result_csv_path(self):
         return f'{self.save_dir}/{self.retrieval_tag}/n{self.n_local}/{self.retrieval_tag}_rs{self.retrieve_size}_cs{self.chunk_size}_n{self.n_local}_accuracy.csv'
 
+    def get_profile_json_path(self):
+        return f'{self.save_dir}/{self.retrieval_tag}/n{self.n_local}/{self.retrieval_tag}_rs{self.retrieve_size}_cs{self.chunk_size}_n{self.n_local}_profile.json'
+
+    def get_video_profile_json_path(self, video_id):
+        return (
+            f'{self.save_dir}/{self.retrieval_tag}/n{self.n_local}/profiles/'
+            f'{self.retrieval_tag}_rs{self.retrieve_size}_cs{self.chunk_size}_n{self.n_local}_{video_id}_profile.json'
+        )
+
+    def get_profile_selected_json_path(self):
+        return (
+            f'{self.save_dir}/{self.retrieval_tag}/n{self.n_local}/profiles/'
+            f'{self.retrieval_tag}_rs{self.retrieve_size}_cs{self.chunk_size}_n{self.n_local}_selected_videos_profile.json'
+        )
+
     def _result_key_columns(self, df):
         if 'question_idx' in df.columns:
             return 'question_idx'
@@ -303,23 +336,81 @@ class BaseVQA:
         self.completed_questions.setdefault(str(video_id), set()).add(str(question_key))
 
     def analyze(self, debug=False):
-        video_annos = self.anno[:1] if debug else self.anno
-        for video_sample in tqdm(video_annos):
-            logger.debug(f'video_id: {video_sample["video_id"]}')
-            self.analyze_a_video(video_sample)
+        profiler = get_profiler()
+        selected_video_summaries = []
+        try:
+            video_annos = self.anno[:1] if debug else self.anno
+            if self.profile_video_ids:
+                video_annos = [
+                    video_sample for video_sample in video_annos
+                    if str(video_sample["video_id"]) in self.profile_video_ids
+                ]
+                logger.info(
+                    f'Filtered videos for profiling/analysis: '
+                    f'{len(video_annos)} selected out of {len(self.anno[:1] if debug else self.anno)}'
+                )
+            for video_sample in tqdm(video_annos):
+                video_id = str(video_sample["video_id"])
+                logger.debug(f'video_id: {video_id}')
+                should_profile = profiler.is_enabled() and (
+                    not self.profile_video_ids or video_id in self.profile_video_ids
+                )
 
-        if not any(self.record.values()):
-            logger.info('No new results were generated in this run.')
-            return
+                if profiler.is_enabled() and self.profile_video_ids:
+                    profiler.configure(
+                        enabled=should_profile,
+                        output_path=self.get_video_profile_json_path(video_id) if should_profile else None,
+                        reset=should_profile,
+                    )
+                    if should_profile:
+                        profiler.update_metadata(
+                            video_id=video_id,
+                            video_duration=video_sample.get("duration"),
+                            num_questions=len(video_sample.get("conversations", [])),
+                        )
 
-        dfs = []
-        for (retrieve_size, chunk_size), dict_list in self.record.items():
-            df = pd.DataFrame(dict_list)
-            df['retrieve_size'] = retrieve_size
-            df['chunk_size'] = chunk_size
-            dfs.append(df)
-        final_df = pd.concat(dfs, ignore_index=True)
-        final_df.to_csv(f'{self.save_dir}/{self.num_chunks}_{self.chunk_idx}.csv', index=False)
+                self.analyze_a_video(video_sample)
+
+                if should_profile:
+                    summary = profiler.summary()
+                    profiler.dump()
+                    selected_video_summaries.append(summary)
+
+            if not any(self.record.values()):
+                logger.info('No new results were generated in this run.')
+                return
+
+            dfs = []
+            for (retrieve_size, chunk_size), dict_list in self.record.items():
+                df = pd.DataFrame(dict_list)
+                df['retrieve_size'] = retrieve_size
+                df['chunk_size'] = chunk_size
+                dfs.append(df)
+            final_df = pd.concat(dfs, ignore_index=True)
+            final_df.to_csv(f'{self.save_dir}/{self.num_chunks}_{self.chunk_idx}.csv', index=False)
+        finally:
+            if profiler.is_enabled():
+                if self.profile_video_ids:
+                    if selected_video_summaries:
+                        output_path = self.get_profile_selected_json_path()
+                        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                        with open(output_path, 'w', encoding='utf-8') as f:
+                            json.dump(
+                                {
+                                    'enabled': True,
+                                    'metadata': {
+                                        'save_dir': self.save_dir,
+                                        'retrieval_tag': self.retrieval_tag,
+                                        'selected_video_ids': sorted(self.profile_video_ids),
+                                    },
+                                    'videos': selected_video_summaries,
+                                },
+                                f,
+                                indent=2,
+                                ensure_ascii=True,
+                            )
+                else:
+                    profiler.dump()
 
 
 def str2bool(value):
@@ -358,6 +449,8 @@ def work(QA_CLASS):
     parser.add_argument("--fusion_token_topk", type=int, default=None)
     parser.add_argument("--use_video_cache", type=str2bool, nargs='?', const=True, default=True)
     parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True)
+    parser.add_argument("--profile_perf", type=str2bool, nargs='?', const=True, default=False)
+    parser.add_argument("--profile_video_ids", type=str, default="")
     args = parser.parse_args()
 
     if not args.debug:
@@ -365,6 +458,8 @@ def work(QA_CLASS):
         warnings.filterwarnings('ignore')
 
     os.makedirs(args.save_dir, exist_ok=True)
+    configure_profiling(enabled=args.profile_perf, reset=True)
+    profile_video_ids = [x.strip() for x in args.profile_video_ids.split(",") if x.strip()]
 
     # fix random seed
     random.seed(2024)
@@ -417,6 +512,7 @@ def work(QA_CLASS):
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,
         save_dir=args.save_dir,
+        profile_video_ids=profile_video_ids,
     )
 
     retrieve_analyzer.analyze(debug=args.debug)

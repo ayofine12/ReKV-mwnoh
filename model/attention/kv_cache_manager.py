@@ -3,6 +3,7 @@ import torch
 from typing import Optional, Tuple
 
 from .dot_production_attention import get_multi_stage_dot_production_attention
+from model.profiling import profile_section
 
 
 # Allocate a fixed-size block of GPU memory specifically for storing the KV-Cache of the local_window.
@@ -1119,111 +1120,111 @@ class ContextManager:
         query: (batch_size, num_heads, length, dim_head)
         return [init_k, retrieved_k] and the respective v
         """
+        with profile_section("retrieval.total"):
+            if query is not None:  # retrieve based on the attention score between query and context's representative keys
+                block_topk = self._calc_block_topk(query)
+                self.set_retrieved_block_indices(block_topk)
 
-        if query is not None:  # retrieve based on the attention score between query and context's representative keys
-            block_topk = self._calc_block_topk(query)
-            self.set_retrieved_block_indices(block_topk)
+            assert len(self.retrieved_block_indices) == self.num_units
 
-        assert len(self.retrieved_block_indices) == self.num_units
+            global_h_k = self.global_buffer[0]
+            global_h_v = self.global_buffer[1]
+            slot_counts = [self._unit_slot_count(self.retrieved_block_indices[u]) for u in range(self.num_units)]
+            max_slot_count = max(slot_counts, default=0)
 
-        global_h_k = self.global_buffer[0]
-        global_h_v = self.global_buffer[1]
-        slot_counts = [self._unit_slot_count(self.retrieved_block_indices[u]) for u in range(self.num_units)]
-        max_slot_count = max(slot_counts, default=0)
+            with profile_section("retrieval.kv_load"):
+                with torch.cuda.stream(GLOBAL_STREAM):
+                    if self.init_exc:  # init KV were loaded in global_h_k, context KV were offloaded in global_blocks
+                        # offload LRU blocks
+                        for u in range(self.num_units):
+                            num_remove = len(self.cached_blocks[u]) - self.max_cached_block
+                            selected_blocks = self._unit_selected_blocks(self.retrieved_block_indices[u])
+                            for b_idx in selected_blocks:
+                                if b_idx not in self.cached_blocks[u]:
+                                    num_remove += 1
+                            self._remove_lru_blocks(u, num_remove, selected_blocks)
 
-        with torch.cuda.stream(GLOBAL_STREAM):
-            if self.init_exc:  # init KV were loaded in global_h_k, context KV were offloaded in global_blocks
-                # offload LRU blocks
-                for u in range(self.num_units):
-                    num_remove = len(self.cached_blocks[u]) - self.max_cached_block
-                    selected_blocks = self._unit_selected_blocks(self.retrieved_block_indices[u])
-                    for b_idx in selected_blocks:
-                        if b_idx not in self.cached_blocks[u]:
-                            num_remove += 1
-                    self._remove_lru_blocks(u, num_remove, selected_blocks)
+                        self.load_count += 1
+                        for u in range(self.num_units):
+                            for b_idx in self._unit_selected_blocks(self.retrieved_block_indices[u]):
+                                self.cached_blocks[u][b_idx] = self.load_count
 
-                self.load_count += 1
-                for u in range(self.num_units):
-                    for b_idx in self._unit_selected_blocks(self.retrieved_block_indices[u]):
-                        self.cached_blocks[u][b_idx] = self.load_count
-                
-                # no need to load init KV
-                init_st = 0
-                init_ed = init_st + self.init_k.size(-2)
-                ed = init_ed
-                assert self.global_buffer_init_st == init_st or self.global_buffer_init_ed == init_ed
-                if max_slot_count > 0:
-                    global_h_k[:, :, init_ed:init_ed + max_slot_count * self.block_size, :].zero_()
-                    global_h_v[:, :, init_ed:init_ed + max_slot_count * self.block_size, :].zero_()
+                        # no need to load init KV
+                        init_st = 0
+                        init_ed = init_st + self.init_k.size(-2)
+                        ed = init_ed
+                        assert self.global_buffer_init_st == init_st or self.global_buffer_init_ed == init_ed
+                        if max_slot_count > 0:
+                            global_h_k[:, :, init_ed:init_ed + max_slot_count * self.block_size, :].zero_()
+                            global_h_v[:, :, init_ed:init_ed + max_slot_count * self.block_size, :].zero_()
 
-                # load retrieved context KV
-                for u in range(self.num_units):
-                    selected_blocks = self._unit_selected_blocks(self.retrieved_block_indices[u])
-                    if len(selected_blocks) == 0:
-                        continue
-                    assert selected_blocks[-1] < self.num_global_block, f'{selected_blocks[-1]}, {self.num_global_block}'
-                    for b_idx in selected_blocks:
-                        self.global_blocks[u][b_idx].load()
-                    for cnt in range(slot_counts[u]):
-                        st = init_ed + cnt * self.block_size
-                        ed = st + self.block_size
-                        if self._use_head_specific_retrieval():
-                            for head_idx in range(self.num_heads_kv):
-                                b_idx = self._get_slot_block_index(self.retrieved_block_indices[u], cnt, head_idx=head_idx)
-                                if b_idx is None:
-                                    continue
-                                block_gpu = self.global_blocks[u][b_idx].get()
-                                global_h_k[u, head_idx, st:ed, :].copy_(block_gpu[0, head_idx], non_blocking=True)
-                                global_h_v[u, head_idx, st:ed, :].copy_(block_gpu[1, head_idx], non_blocking=True)
-                        else:
-                            b_idx = self._get_slot_block_index(self.retrieved_block_indices[u], cnt)
-                            self.global_blocks[u][b_idx].load((global_h_k[u, :, st:ed, :], global_h_v[u, :, st:ed, :]))
+                        # load retrieved context KV
+                        for u in range(self.num_units):
+                            selected_blocks = self._unit_selected_blocks(self.retrieved_block_indices[u])
+                            if len(selected_blocks) == 0:
+                                continue
+                            assert selected_blocks[-1] < self.num_global_block, f'{selected_blocks[-1]}, {self.num_global_block}'
+                            for b_idx in selected_blocks:
+                                self.global_blocks[u][b_idx].load()
+                            for cnt in range(slot_counts[u]):
+                                st = init_ed + cnt * self.block_size
+                                ed = st + self.block_size
+                                if self._use_head_specific_retrieval():
+                                    for head_idx in range(self.num_heads_kv):
+                                        b_idx = self._get_slot_block_index(self.retrieved_block_indices[u], cnt, head_idx=head_idx)
+                                        if b_idx is None:
+                                            continue
+                                        block_gpu = self.global_blocks[u][b_idx].get()
+                                        global_h_k[u, head_idx, st:ed, :].copy_(block_gpu[0, head_idx], non_blocking=True)
+                                        global_h_v[u, head_idx, st:ed, :].copy_(block_gpu[1, head_idx], non_blocking=True)
+                                else:
+                                    b_idx = self._get_slot_block_index(self.retrieved_block_indices[u], cnt)
+                                    self.global_blocks[u][b_idx].load((global_h_k[u, :, st:ed, :], global_h_v[u, :, st:ed, :]))
 
-            else:  # init KV and context are in self.global_remainder
-                # load init KV
-                init_st = 0
-                init_ed = init_st + self.n_init
-                global_h_k[:, :, init_st:init_ed] = self.global_remainder[0][:, :, init_st:init_ed]
-                global_h_v[:, :, init_st:init_ed] = self.global_remainder[1][:, :, init_st:init_ed]
-                ed = init_ed
-                if max_slot_count > 0:
-                    global_h_k[:, :, init_ed:init_ed + max_slot_count * self.block_size, :].zero_()
-                    global_h_v[:, :, init_ed:init_ed + max_slot_count * self.block_size, :].zero_()
+                    else:  # init KV and context are in self.global_remainder
+                        # load init KV
+                        init_st = 0
+                        init_ed = init_st + self.n_init
+                        global_h_k[:, :, init_st:init_ed] = self.global_remainder[0][:, :, init_st:init_ed]
+                        global_h_v[:, :, init_st:init_ed] = self.global_remainder[1][:, :, init_st:init_ed]
+                        ed = init_ed
+                        if max_slot_count > 0:
+                            global_h_k[:, :, init_ed:init_ed + max_slot_count * self.block_size, :].zero_()
+                            global_h_v[:, :, init_ed:init_ed + max_slot_count * self.block_size, :].zero_()
 
-                # load retrieved context KV
-                for u in range(self.num_units):
-                    for cnt in range(slot_counts[u]):
-                        st = init_ed + cnt * self.block_size
-                        ed = st + self.block_size
-                        if self._use_head_specific_retrieval():
-                            for head_idx in range(self.num_heads_kv):
-                                b_idx = self._get_slot_block_index(self.retrieved_block_indices[u], cnt, head_idx=head_idx)
-                                if b_idx is None:
-                                    continue
-                                remainder_st = init_ed + b_idx * self.block_size
-                                remainder_ed = remainder_st + self.block_size
-                                if remainder_st >= self.global_remainder[0].size(2):
-                                    continue
-                                global_h_k[u, head_idx, st:ed] = self.global_remainder[0][u, head_idx, remainder_st:remainder_ed]
-                                global_h_v[u, head_idx, st:ed] = self.global_remainder[1][u, head_idx, remainder_st:remainder_ed]
-                        else:
-                            b_idx = self._get_slot_block_index(self.retrieved_block_indices[u], cnt)
-                            remainder_st = init_ed + b_idx * self.block_size
-                            remainder_ed = remainder_st + self.block_size
-                            if remainder_st >= self.global_remainder[0].size(2):
-                                break
-                            global_h_k[u, :, st:ed] = self.global_remainder[0][u, :, remainder_st:remainder_ed]
-                            global_h_v[u, :, st:ed] = self.global_remainder[1][u, :, remainder_st:remainder_ed]
+                        # load retrieved context KV
+                        for u in range(self.num_units):
+                            for cnt in range(slot_counts[u]):
+                                st = init_ed + cnt * self.block_size
+                                ed = st + self.block_size
+                                if self._use_head_specific_retrieval():
+                                    for head_idx in range(self.num_heads_kv):
+                                        b_idx = self._get_slot_block_index(self.retrieved_block_indices[u], cnt, head_idx=head_idx)
+                                        if b_idx is None:
+                                            continue
+                                        remainder_st = init_ed + b_idx * self.block_size
+                                        remainder_ed = remainder_st + self.block_size
+                                        if remainder_st >= self.global_remainder[0].size(2):
+                                            continue
+                                        global_h_k[u, head_idx, st:ed] = self.global_remainder[0][u, head_idx, remainder_st:remainder_ed]
+                                        global_h_v[u, head_idx, st:ed] = self.global_remainder[1][u, head_idx, remainder_st:remainder_ed]
+                                else:
+                                    b_idx = self._get_slot_block_index(self.retrieved_block_indices[u], cnt)
+                                    remainder_st = init_ed + b_idx * self.block_size
+                                    remainder_ed = remainder_st + self.block_size
+                                    if remainder_st >= self.global_remainder[0].size(2):
+                                        break
+                                    global_h_k[u, :, st:ed] = self.global_remainder[0][u, :, remainder_st:remainder_ed]
+                                    global_h_v[u, :, st:ed] = self.global_remainder[1][u, :, remainder_st:remainder_ed]
 
-            global_h_k = global_h_k[:, :, :ed, :]
-            global_h_v = global_h_v[:, :, :ed, :]
-            # assert global_h_k.size(-2) == global_h_v.size(-2) == self.n_init + block_num * self.block_size
+                    global_h_k = global_h_k[:, :, :ed, :]
+                    global_h_v = global_h_v[:, :, :ed, :]
 
-        if self.async_global_stream:
-            torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
+                if self.async_global_stream:
+                    torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
 
-        assert global_h_k.size(-2) <= self.n_init + self.n_local
-        return global_h_k, global_h_v 
+            assert global_h_k.size(-2) <= self.n_init + self.n_local
+            return global_h_k, global_h_v
 
     def _get_q_token_topk(self, q_len: int) -> int:
         return max(1, math.ceil(self.q_topk_ratio * q_len))
@@ -1237,6 +1238,10 @@ class ContextManager:
     def _calc_block_topk(
         self, global_h_q
     ):
+        with profile_section("retrieval.block_topk_total"):
+            return self._calc_block_topk_impl(global_h_q)
+
+    def _calc_block_topk_impl(self, global_h_q):
         if self.retrieval_fusion != "none":
             return self._calc_hybrid_block_topk(global_h_q)
 
@@ -1434,7 +1439,7 @@ class ContextManager:
                 for u in range(self.num_units):
                     ret[u] = list(filter(lambda idx: idx < logits.shape[1], ret[u]))
 
-        return ret
+            return ret
 
     # load init KV
     def get_global_hidden_and_mask(self, exc_length):

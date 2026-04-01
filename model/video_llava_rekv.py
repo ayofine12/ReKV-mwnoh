@@ -4,6 +4,7 @@ from logzero import logger
 
 from model.patch import patch_hf
 from model.abstract_rekv import Abstract_ReKV
+from model.profiling import profile_phase, profile_section
 
 
 class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
@@ -55,38 +56,44 @@ class VideoLlava_ReKV(VideoLlavaForConditionalGeneration, Abstract_ReKV):
         for layer_kv in self.kv_cache:  # retrieval mode
             layer_kv.set_retrieval()
         
-        if retrieved_indices is None:  # Internal retrieval
-            out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
-            past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
-        else:  # External retrieval
-            for layer_kv in self.kv_cache:
-                assert layer_kv.block_size == self.n_frame_tokens, f'block_size: {layer_kv.block_size}, n_frame_tokens: {self.n_frame_tokens}'
-                layer_kv.set_retrieved_block_indices(retrieved_indices)
-            out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
-            past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
+        with profile_phase("retrieval"):
+            with profile_section("qa.step"):
+                if retrieved_indices is None:  # Internal retrieval
+                    out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
+                    past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
+                else:  # External retrieval
+                    for layer_kv in self.kv_cache:
+                        assert layer_kv.block_size == self.n_frame_tokens, f'block_size: {layer_kv.block_size}, n_frame_tokens: {self.n_frame_tokens}'
+                        layer_kv.set_retrieved_block_indices(retrieved_indices)
+                    out = self.language_model(input_ids=input_ids, use_cache=True, past_key_values=self.kv_cache)
+                    past_key_values = out.past_key_values  # Retrieved KV-Cache: L x 2 x (B, h, N, Dh)
         
         for layer_kv in self.kv_cache:  # reset to default
             layer_kv.reset_retrieval()
 
         for i in range(max_new_tokens):
             if i == 0:  # prefill
-                input_ids = self.processor.tokenizer(input_text['prompt']).input_ids[1:]  # remove <s>
-                input_ids = torch.as_tensor([input_ids], device=device)
-                inputs_embeds = self.get_input_embeddings()(input_ids)
-                out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values)
-                past_key_values = out.past_key_values
-                logits = out.logits
+                with profile_phase("prefill"):
+                    with profile_section("qa.step"):
+                        input_ids = self.processor.tokenizer(input_text['prompt']).input_ids[1:]  # remove <s>
+                        input_ids = torch.as_tensor([input_ids], device=device)
+                        inputs_embeds = self.get_input_embeddings()(input_ids)
+                        out = self.language_model(inputs_embeds=inputs_embeds, use_cache=True, past_key_values=past_key_values)
+                        past_key_values = out.past_key_values
+                        logits = out.logits
             else:  # decoding
-                out = self.language_model(
-                    input_ids=torch.as_tensor(
-                        [[token]],
-                        device=device,
-                    ),
-                    use_cache=True,
-                    past_key_values=past_key_values,
-                )
-                logits = out.logits
-                past_key_values = out.past_key_values
+                with profile_phase("decode"):
+                    with profile_section("qa.step"):
+                        out = self.language_model(
+                            input_ids=torch.as_tensor(
+                                [[token]],
+                                device=device,
+                            ),
+                            use_cache=True,
+                            past_key_values=past_key_values,
+                        )
+                        logits = out.logits
+                        past_key_values = out.past_key_values
 
             last_token_logits = logits[0, -1, :]
             
