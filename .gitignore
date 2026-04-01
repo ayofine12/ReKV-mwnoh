@@ -30,9 +30,4 @@ model_zoo/*
 !model_zoo/.gitkeep
 results/*
 !results/.gitkeep
-!tools/run_entity_grid.sh
-!tools/run_event_grid.sh
-!tools/run_reasoning_grid.sh
-!tools/run_hybrid.sh
-!tools/run_mean.sh
-!tools/run_token.sh
+!tools/*.sh
