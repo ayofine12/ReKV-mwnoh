@@ -19,6 +19,30 @@ class Abstract_ReKV:
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
+    def set_retrieve_size(self, topk):
+        self.topk = topk
+        if self.kv_cache is None:
+            return
+
+        for layer_kv in self.kv_cache:
+            # global_buffer shape: (2, batch, num_heads_kv, buffer_len, dim_head)
+            buffer_len = layer_kv.global_buffer.size(3)
+            max_supported_topk = max(0, (buffer_len - layer_kv.n_init) // layer_kv.block_size)
+            if topk > max_supported_topk:
+                raise ValueError(
+                    f"Requested topk={topk} exceeds allocated retrieval buffer capacity={max_supported_topk}. "
+                    "Load the model with a larger topk first."
+                )
+            layer_kv.topk = topk
+
+    def set_rerank_candidate_topk(self, rerank_candidate_topk):
+        if self.kv_cache is None:
+            return
+
+        for layer_kv in self.kv_cache:
+            if hasattr(layer_kv, "rerank_candidate_topk"):
+                layer_kv.rerank_candidate_topk = rerank_candidate_topk
+
     @torch.inference_mode()
     def encode_init_prompt(self):
         if not isinstance(self.init_prompt_ids, torch.Tensor):

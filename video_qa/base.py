@@ -63,7 +63,8 @@ class BaseVQA:
                  k_token_agg="max", k_topk_ratio=0.3,
                  head_specific_retrieval=False, use_video_cache=True,
                  retrieval_fusion="none", fusion_mean_topk=None, fusion_token_topk=None,
-                 profile_video_ids=None) -> None:
+                 rerank_candidate_topk=None,
+                 profile_video_ids=None, retrieve_sizes=None, rerank_candidate_topks=None) -> None:
         
         self.sample_fps = sample_fps
         self.use_video_cache = use_video_cache
@@ -74,6 +75,7 @@ class BaseVQA:
         # Retrieval Hyperparams
         assert chunk_size <= retrieve_size, f'chunk_size: {chunk_size}, retrieve_size: {retrieve_size}'
         self.retrieve_size = retrieve_size
+        self.retrieve_sizes = list(dict.fromkeys(retrieve_sizes or [retrieve_size]))
         self.chunk_size = chunk_size
         self.encode_chunk_size = encode_chunk_size
         self.n_local = n_local
@@ -85,6 +87,12 @@ class BaseVQA:
         self.k_topk_ratio = k_topk_ratio
         self.head_specific_retrieval = head_specific_retrieval
         self.retrieval_fusion = retrieval_fusion
+        self.rerank_candidate_topk = rerank_candidate_topk
+        if self.retrieval_fusion == "rerank" and self.rerank_candidate_topk is None:
+            self.rerank_candidate_topk = max(retrieve_size, retrieve_size * 4)
+        self.rerank_candidate_topks = list(dict.fromkeys(
+            rerank_candidate_topks or [self.rerank_candidate_topk]
+        ))
         if fusion_mean_topk is None and fusion_token_topk is None:
             fusion_mean_topk = retrieve_size // 2
             fusion_token_topk = retrieve_size - fusion_mean_topk
@@ -101,39 +109,7 @@ class BaseVQA:
                 f'{self.fusion_mean_topk} + {self.fusion_token_topk} != {self.retrieve_size}'
             )
 
-        if self.retrieval_fusion != "none":
-            self.retrieval_tag = (
-                f'head_specific_{head_specific_retrieval}-fusion_{self.retrieval_fusion}'
-                f'-mean_topk_{self.fusion_mean_topk}-token_topk_{self.fusion_token_topk}'
-                f'-token_qagg_{q_token_agg}-qtopk_{q_topk_ratio}'
-                f'-kagg_{k_token_agg}-ktopk_{k_topk_ratio}'
-            )
-        elif kv_repr == "mean":
-            if q_repr == "mean":
-                self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}'
-            else:
-                if q_token_agg == "mean":
-                    self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}'
-                else:
-                    self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}-qtopk_{q_topk_ratio}'
-
-        else:
-            if k_token_agg == "max":
-                if q_repr == "mean":
-                    self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-kagg_{k_token_agg}'
-                else:
-                    if q_token_agg == "mean":
-                        self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}-kagg_{k_token_agg}'
-                    else:
-                        self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}-qtopk_{q_topk_ratio}-kagg_{k_token_agg}'
-            else:
-                if q_repr == "mean":
-                    self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-kagg_{k_token_agg}-ktopk_{k_topk_ratio}'
-                else:
-                    if q_token_agg == "mean":
-                        self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}-kagg_{k_token_agg}-ktopk_{k_topk_ratio}'
-                    else:
-                        self.retrieval_tag = f'head_specific_{head_specific_retrieval}-kv_repr_{kv_repr.replace("_", "-")}-q_repr_{q_repr}-qagg_{q_token_agg}-qtopk_{q_topk_ratio}-kagg_{k_token_agg}-ktopk_{k_topk_ratio}'
+        self.retrieval_tag = self._build_retrieval_tag()
 
         self.num_chunks = num_chunks
         self.chunk_idx = chunk_idx
@@ -144,7 +120,13 @@ class BaseVQA:
 
         self.save_dir = save_dir
         self.choice_letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
-        self.record = {(self.retrieve_size, self.chunk_size): []}
+        self.record = {}
+        for size in self.retrieve_sizes:
+            if self.retrieval_fusion == "rerank":
+                for candidate_topk in self.rerank_candidate_topks:
+                    self.record[(size, self.chunk_size, candidate_topk)] = []
+            else:
+                self.record[(size, self.chunk_size, self.rerank_candidate_topk)] = []
         self.completed_questions = self._load_completed_questions()
         self.profile_video_ids = set(profile_video_ids or [])
         profiler = get_profiler()
@@ -159,9 +141,73 @@ class BaseVQA:
                 q_repr=self.q_repr,
                 retrieval_fusion=self.retrieval_fusion,
                 head_specific_retrieval=self.head_specific_retrieval,
+                rerank_candidate_topk=self.rerank_candidate_topk,
             )
             if not self.profile_video_ids:
                 profiler.configure(output_path=self.get_profile_json_path())
+
+    def _build_retrieval_tag(self):
+        if self.retrieval_fusion != "none":
+            if self.retrieval_fusion == "rerank":
+                return (
+                    f'head_specific_{self.head_specific_retrieval}-fusion_{self.retrieval_fusion}'
+                    f'-cand_topk_{self.rerank_candidate_topk}'
+                    f'-token_qagg_{self.q_token_agg}-qtopk_{self.q_topk_ratio}'
+                    f'-kagg_{self.k_token_agg}-ktopk_{self.k_topk_ratio}'
+                )
+            return (
+                f'head_specific_{self.head_specific_retrieval}-fusion_{self.retrieval_fusion}'
+                f'-mean_topk_{self.fusion_mean_topk}-token_topk_{self.fusion_token_topk}'
+                f'-token_qagg_{self.q_token_agg}-qtopk_{self.q_topk_ratio}'
+                f'-kagg_{self.k_token_agg}-ktopk_{self.k_topk_ratio}'
+            )
+
+        if self.kv_repr == "mean":
+            if self.q_repr == "mean":
+                return f'head_specific_{self.head_specific_retrieval}-kv_repr_{self.kv_repr.replace("_", "-")}-q_repr_{self.q_repr}'
+            if self.q_token_agg == "mean":
+                return f'head_specific_{self.head_specific_retrieval}-kv_repr_{self.kv_repr.replace("_", "-")}-q_repr_{self.q_repr}-qagg_{self.q_token_agg}'
+            return f'head_specific_{self.head_specific_retrieval}-kv_repr_{self.kv_repr.replace("_", "-")}-q_repr_{self.q_repr}-qagg_{self.q_token_agg}-qtopk_{self.q_topk_ratio}'
+
+        if self.k_token_agg == "max":
+            if self.q_repr == "mean":
+                return f'head_specific_{self.head_specific_retrieval}-kv_repr_{self.kv_repr.replace("_", "-")}-q_repr_{self.q_repr}-kagg_{self.k_token_agg}'
+            if self.q_token_agg == "mean":
+                return f'head_specific_{self.head_specific_retrieval}-kv_repr_{self.kv_repr.replace("_", "-")}-q_repr_{self.q_repr}-qagg_{self.q_token_agg}-kagg_{self.k_token_agg}'
+            return f'head_specific_{self.head_specific_retrieval}-kv_repr_{self.kv_repr.replace("_", "-")}-q_repr_{self.q_repr}-qagg_{self.q_token_agg}-qtopk_{self.q_topk_ratio}-kagg_{self.k_token_agg}'
+
+        if self.q_repr == "mean":
+            return f'head_specific_{self.head_specific_retrieval}-kv_repr_{self.kv_repr.replace("_", "-")}-q_repr_{self.q_repr}-kagg_{self.k_token_agg}-ktopk_{self.k_topk_ratio}'
+        if self.q_token_agg == "mean":
+            return f'head_specific_{self.head_specific_retrieval}-kv_repr_{self.kv_repr.replace("_", "-")}-q_repr_{self.q_repr}-qagg_{self.q_token_agg}-kagg_{self.k_token_agg}-ktopk_{self.k_topk_ratio}'
+        return f'head_specific_{self.head_specific_retrieval}-kv_repr_{self.kv_repr.replace("_", "-")}-q_repr_{self.q_repr}-qagg_{self.q_token_agg}-qtopk_{self.q_topk_ratio}-kagg_{self.k_token_agg}-ktopk_{self.k_topk_ratio}'
+
+    def _current_record_key(self):
+        return (self.retrieve_size, self.chunk_size, self.rerank_candidate_topk)
+
+    def set_retrieval_config(self, retrieve_size=None, rerank_candidate_topk=None):
+        if retrieve_size is not None:
+            self.retrieve_size = retrieve_size
+        if rerank_candidate_topk is not None:
+            self.rerank_candidate_topk = rerank_candidate_topk
+        self.retrieval_tag = self._build_retrieval_tag()
+        self.record.setdefault(self._current_record_key(), [])
+        self.completed_questions = self._load_completed_questions()
+        profiler = get_profiler()
+        if profiler.is_enabled():
+            profiler.update_metadata(
+                retrieval_tag=self.retrieval_tag,
+                retrieve_size=self.retrieve_size,
+                rerank_candidate_topk=self.rerank_candidate_topk,
+            )
+        if hasattr(self.qa_model, "set_retrieve_size"):
+            self.qa_model.set_retrieve_size(self.retrieve_size)
+        if hasattr(self.qa_model, "set_rerank_candidate_topk"):
+            self.qa_model.set_rerank_candidate_topk(self.rerank_candidate_topk)
+
+    def set_retrieve_size(self, retrieve_size):
+        self.retrieve_size = retrieve_size
+        self.set_retrieval_config(retrieve_size=retrieve_size)
 
     def split_list(self, lst, n):
         """Split a list into n (roughly) equal-sized chunks"""
@@ -381,10 +427,11 @@ class BaseVQA:
                 return
 
             dfs = []
-            for (retrieve_size, chunk_size), dict_list in self.record.items():
+            for (retrieve_size, chunk_size, rerank_candidate_topk), dict_list in self.record.items():
                 df = pd.DataFrame(dict_list)
                 df['retrieve_size'] = retrieve_size
                 df['chunk_size'] = chunk_size
+                df['rerank_candidate_topk'] = rerank_candidate_topk
                 dfs.append(df)
             final_df = pd.concat(dfs, ignore_index=True)
             final_df.to_csv(f'{self.save_dir}/{self.num_chunks}_{self.chunk_idx}.csv', index=False)
@@ -435,6 +482,7 @@ def work(QA_CLASS):
     parser.add_argument("--model", type=str, default="llava_ov_7b")
     parser.add_argument("--n_local", type=int, default=15000)
     parser.add_argument("--retrieve_size", type=int, default=64)
+    parser.add_argument("--retrieve_sizes", type=str, default="")
     parser.add_argument("--retrieve_chunk_size", type=int, default=1)
     parser.add_argument("--encode_chunk_size", type=int, default=8)
     parser.add_argument("--kv_repr", type=str, default="mean")
@@ -444,9 +492,11 @@ def work(QA_CLASS):
     parser.add_argument("--k_token_agg", type=str, default="max", choices=["max", "topk"])
     parser.add_argument("--k_topk_ratio", type=float, default=0.3)
     parser.add_argument("--head_specific_retrieval", type=str2bool, nargs='?', const=True, default=False)
-    parser.add_argument("--retrieval_fusion", type=str, default="none", choices=["none", "quota"])
+    parser.add_argument("--retrieval_fusion", type=str, default="none", choices=["none", "quota", "rerank"])
     parser.add_argument("--fusion_mean_topk", type=int, default=None)
     parser.add_argument("--fusion_token_topk", type=int, default=None)
+    parser.add_argument("--rerank_candidate_topk", type=int, default=None)
+    parser.add_argument("--rerank_candidate_topks", type=str, default="")
     parser.add_argument("--use_video_cache", type=str2bool, nargs='?', const=True, default=True)
     parser.add_argument("--debug", type=str2bool, nargs='?', const=True, default=True)
     parser.add_argument("--profile_perf", type=str2bool, nargs='?', const=True, default=False)
@@ -460,6 +510,13 @@ def work(QA_CLASS):
     os.makedirs(args.save_dir, exist_ok=True)
     configure_profiling(enabled=args.profile_perf, reset=True)
     profile_video_ids = [x.strip() for x in args.profile_video_ids.split(",") if x.strip()]
+    retrieve_sizes = [int(x.strip()) for x in args.retrieve_sizes.split(",") if x.strip()]
+    if not retrieve_sizes:
+        retrieve_sizes = [args.retrieve_size]
+    rerank_candidate_topks = [int(x.strip()) for x in args.rerank_candidate_topks.split(",") if x.strip()]
+    if not rerank_candidate_topks:
+        rerank_candidate_topks = [args.rerank_candidate_topk]
+    model_retrieve_size = max(retrieve_sizes)
 
     # fix random seed
     random.seed(2024)
@@ -472,7 +529,7 @@ def work(QA_CLASS):
     videoqa_model, videoqa_processor = load_func(
         model_path=model_path,
         n_local=args.n_local,
-        topk=args.retrieve_size,
+        topk=model_retrieve_size,
         chunk_size=args.retrieve_chunk_size,
         kv_repr=args.kv_repr,
         q_repr=args.q_repr,
@@ -484,6 +541,7 @@ def work(QA_CLASS):
         retrieval_fusion=args.retrieval_fusion,
         fusion_mean_topk=args.fusion_mean_topk,
         fusion_token_topk=args.fusion_token_topk,
+        rerank_candidate_topk=args.rerank_candidate_topk,
     )
 
     # Load ground truth file
@@ -495,6 +553,8 @@ def work(QA_CLASS):
         qa_model=videoqa_model,
         qa_processor=videoqa_processor,
         retrieve_size=args.retrieve_size,
+        retrieve_sizes=retrieve_sizes,
+        rerank_candidate_topks=rerank_candidate_topks,
         chunk_size=args.retrieve_chunk_size,
         encode_chunk_size=args.encode_chunk_size,
         n_local=args.n_local,
@@ -508,6 +568,7 @@ def work(QA_CLASS):
         retrieval_fusion=args.retrieval_fusion,
         fusion_mean_topk=args.fusion_mean_topk,
         fusion_token_topk=args.fusion_token_topk,
+        rerank_candidate_topk=args.rerank_candidate_topk,
         use_video_cache=args.use_video_cache,
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,

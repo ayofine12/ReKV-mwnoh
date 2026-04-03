@@ -131,46 +131,64 @@ class ReKVOfflineVQA(BaseVQA):
         self.qa_model.encode_init_prompt()
         self.qa_model.encode_video(video_tensor, self.encode_chunk_size)
 
-        for sample in video_sample['conversations']:
-            logger.debug(f'sample: {sample}')
-            question = sample['question']
-            answer = sample['answer']
-            
-            # QA
-            if 'choices' in sample:  # CloseQA
-                choices = sample['choices']
-                if answer is None:  # FIXME: an ugly fix for some benchmarks do not provide GT
-                    answer = choices[0]
-                correct_choice = self.choice_letters[choices.index(answer)]
-                qa_results = self.video_close_qa(question, choices, correct_choice)
-                result_dict = {
-                    'video_id': video_sample['video_id'],
-                    'question': question,
-                    'choices': choices,
-                    'answer': answer,
-                    'correct_choice': correct_choice,
-                    'pred_answer': qa_results['pred_answer'],
-                    'pred_choice': qa_results['pred_choice'],
-                    'qa_acc': qa_results['acc'] * 100,
-                    'retrieve_size': self.retrieve_size,
-                    'chunk_size': self.chunk_size,
-                }
-            else:  # OpenQA
-                qa_results = self.video_open_qa(question)
-                result_dict = {
-                    'video_id': video_sample['video_id'],
-                    'question': question,
-                    'answer': answer,
-                    'pred_answer': qa_results['pred_answer'],
-                    'retrieve_size': self.retrieve_size,
-                    'chunk_size': self.chunk_size,
-                }
+        if self.retrieval_fusion == "rerank":
+            retrieval_configs = [
+                (retrieve_size, candidate_topk)
+                for candidate_topk in self.rerank_candidate_topks
+                for retrieve_size in self.retrieve_sizes
+            ]
+        else:
+            retrieval_configs = [(retrieve_size, self.rerank_candidate_topk) for retrieve_size in self.retrieve_sizes]
 
-            if 'question_type' in sample:
-                result_dict['task'] = sample['question_type']
+        for retrieve_size, rerank_candidate_topk in retrieval_configs:
+            self.set_retrieval_config(
+                retrieve_size=retrieve_size,
+                rerank_candidate_topk=rerank_candidate_topk,
+            )
+            logger.info(
+                f'Running video {video_id} with retrieve_size={retrieve_size}, '
+                f'rerank_candidate_topk={rerank_candidate_topk}'
+            )
 
-            self.record[(self.retrieve_size, self.chunk_size)].append(result_dict)
-            self.save_result_to_csv(result_dict)
+            for sample in video_sample['conversations']:
+                logger.debug(f'sample: {sample}')
+                question = sample['question']
+                answer = sample['answer']
+
+                if 'choices' in sample:  # CloseQA
+                    choices = sample['choices']
+                    if answer is None:  # FIXME: an ugly fix for some benchmarks do not provide GT
+                        answer = choices[0]
+                    correct_choice = self.choice_letters[choices.index(answer)]
+                    qa_results = self.video_close_qa(question, choices, correct_choice)
+                    result_dict = {
+                        'video_id': video_sample['video_id'],
+                        'question': question,
+                        'choices': choices,
+                        'answer': answer,
+                        'correct_choice': correct_choice,
+                        'pred_answer': qa_results['pred_answer'],
+                        'pred_choice': qa_results['pred_choice'],
+                        'qa_acc': qa_results['acc'] * 100,
+                        'retrieve_size': self.retrieve_size,
+                        'chunk_size': self.chunk_size,
+                    }
+                else:  # OpenQA
+                    qa_results = self.video_open_qa(question)
+                    result_dict = {
+                        'video_id': video_sample['video_id'],
+                        'question': question,
+                        'answer': answer,
+                        'pred_answer': qa_results['pred_answer'],
+                        'retrieve_size': self.retrieve_size,
+                        'chunk_size': self.chunk_size,
+                    }
+
+                if 'question_type' in sample:
+                    result_dict['task'] = sample['question_type']
+
+                self.record[self._current_record_key()].append(result_dict)
+                self.save_result_to_csv(result_dict)
 
 
 if __name__ == "__main__":

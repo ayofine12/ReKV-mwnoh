@@ -120,7 +120,8 @@ def load_model(model_path='model_zoo/LongVA-7B',
                kv_repr="mean", q_repr="mean", q_token_agg="topk", q_topk_ratio=0.3,
                k_token_agg="max", k_topk_ratio=0.3,
                head_specific_retrieval=False,
-               retrieval_fusion="none", fusion_mean_topk=None, fusion_token_topk=None):
+               retrieval_fusion="none", fusion_mean_topk=None, fusion_token_topk=None,
+               rerank_candidate_topk=None):
     n_frame_tokens = 144
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     
@@ -146,6 +147,7 @@ def load_model(model_path='model_zoo/LongVA-7B',
         'retrieval_fusion': retrieval_fusion,
         'fusion_mean_topk': fusion_mean_topk,
         'fusion_token_topk': fusion_token_topk,
+        'rerank_candidate_topk': rerank_candidate_topk,
     }
     model = LongVA_ReKV.from_pretrained(
         model_path, 

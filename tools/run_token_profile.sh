@@ -9,6 +9,19 @@ PROGRAM="${PROJECT_ROOT}/video_qa/rekv_offline_vqa.py"
 export REKV_VIDEO_CACHE_DIR="${REKV_VIDEO_CACHE_DIR:-/mnt/ssd1/mwnoh/LVBench/video_cache}"
 export PYTHONPATH="${PROJECT_ROOT}:${PROJECT_ROOT}/model:${PROJECT_ROOT}/model/longva:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+
+# Nsight Compute can fail to find cuDNN component libraries unless their wheel
+# directory is explicitly visible to the dynamic loader.
+for CUDNN_LIB_DIR in \
+  "/root/mwnoh/anaconda3/lib/python3.13/site-packages/nvidia/cudnn/lib" \
+  "/root/mwnoh/anaconda3/envs/rekv/lib/python3.11/site-packages/nvidia/cudnn/lib"
+do
+  if [[ -d "${CUDNN_LIB_DIR}" ]]; then
+    export LD_LIBRARY_PATH="${CUDNN_LIB_DIR}:${LD_LIBRARY_PATH:-}"
+    break
+  fi
+done
 
 SAMPLE_FPS="${SAMPLE_FPS:-1}"
 SAVE_DIR="${SAVE_DIR:-/mnt/ssd1/mwnoh/LVBench/results/retrieval_token_profile}"

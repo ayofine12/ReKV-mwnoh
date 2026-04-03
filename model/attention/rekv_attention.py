@@ -21,6 +21,7 @@ def rekv_attention_forward(
     retrieval_fusion="none",
     fusion_mean_topk=None,
     fusion_token_topk=None,
+    rerank_candidate_topk=None,
     async_global_stream=True,
     pin_memory=False,
     *args, **kwargs
@@ -75,6 +76,7 @@ def rekv_attention_forward(
                     retrieval_fusion=retrieval_fusion,
                     fusion_mean_topk=fusion_mean_topk,
                     fusion_token_topk=fusion_token_topk,
+                    rerank_candidate_topk=rerank_candidate_topk,
                     fattn=fattn,
                     async_global_stream=async_global_stream,
                     pin_memory=pin_memory,

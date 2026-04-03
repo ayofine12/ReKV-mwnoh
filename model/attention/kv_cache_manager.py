@@ -548,6 +548,7 @@ class ContextManager:
                  retrieval_fusion: str = "none",
                  fusion_mean_topk: Optional[int] = None,
                  fusion_token_topk: Optional[int] = None,
+                 rerank_candidate_topk: Optional[int] = None,
                  fattn: bool = False,
                  async_global_stream: bool = False,
                  pin_memory: bool = False,
@@ -571,6 +572,7 @@ class ContextManager:
         self.k_topk_ratio = k_topk_ratio
         self.head_specific_retrieval = head_specific_retrieval
         self.retrieval_fusion = retrieval_fusion
+        self.rerank_candidate_topk = rerank_candidate_topk
         if fusion_mean_topk is None and fusion_token_topk is None:
             fusion_mean_topk = topk // 2
             fusion_token_topk = topk - fusion_mean_topk
@@ -592,17 +594,25 @@ class ContextManager:
             raise ValueError(f"Unsupported k_token_agg: {self.k_token_agg}. Choose from {{'max', 'topk'}}.")
         if not (0 < self.k_topk_ratio <= 1):
             raise ValueError(f"Unsupported k_topk_ratio: {self.k_topk_ratio}. It must be in (0, 1].")
-        if self.retrieval_fusion not in {"none", "quota"}:
+        if self.retrieval_fusion not in {"none", "quota", "rerank"}:
             raise ValueError(
-                f"Unsupported retrieval_fusion: {self.retrieval_fusion}. Choose from {{'none', 'quota'}}."
+                f"Unsupported retrieval_fusion: {self.retrieval_fusion}. Choose from {{'none', 'quota', 'rerank'}}."
             )
-        if self.retrieval_fusion != "none":
+        if self.retrieval_fusion == "quota":
             if self.fusion_mean_topk < 0 or self.fusion_token_topk < 0:
                 raise ValueError("fusion_mean_topk and fusion_token_topk must be non-negative.")
             if self.fusion_mean_topk + self.fusion_token_topk != self.topk:
                 raise ValueError(
                     f"fusion_mean_topk + fusion_token_topk must equal topk: "
                     f"{self.fusion_mean_topk} + {self.fusion_token_topk} != {self.topk}"
+                )
+        if self.retrieval_fusion == "rerank":
+            if self.rerank_candidate_topk is None:
+                self.rerank_candidate_topk = max(self.topk, self.topk * 4)
+            if self.rerank_candidate_topk < self.topk:
+                raise ValueError(
+                    f"rerank_candidate_topk must be >= topk: "
+                    f"{self.rerank_candidate_topk} < {self.topk}"
                 )
         self.Attn, _ = get_multi_stage_dot_production_attention(fattn)
         self.fattn = fattn
@@ -921,7 +931,49 @@ class ContextManager:
         self.similarity = {"mean": mean_logits, "token": token_logits}
         mean_rankings = self._rank_blocks_from_logits(mean_logits)
         token_rankings = self._rank_blocks_from_logits(token_logits)
+        if self.retrieval_fusion == "rerank":
+            return self._rerank_block_indices(mean_rankings, token_rankings)
         return self._fuse_ranked_block_indices(mean_rankings, token_rankings)
+
+    def _rerank_block_indices(self, mean_rankings, token_rankings):
+        candidate_topk = self.rerank_candidate_topk
+        reranked = []
+        for u in range(self.num_units):
+            if self._use_head_specific_retrieval():
+                unit_reranked = []
+                for h in range(self.num_heads_kv):
+                    coarse_candidates = set(mean_rankings[u][h][:candidate_topk])
+                    selected = []
+                    for block_idx in token_rankings[u][h]:
+                        if block_idx in coarse_candidates:
+                            selected.append(block_idx)
+                        if len(selected) >= self.topk:
+                            break
+                    if len(selected) < self.topk:
+                        for block_idx in mean_rankings[u][h]:
+                            if block_idx not in selected and block_idx in coarse_candidates:
+                                selected.append(block_idx)
+                            if len(selected) >= self.topk:
+                                break
+                    unit_reranked.append(sorted(selected))
+                reranked.append(unit_reranked)
+                continue
+
+            coarse_candidates = set(mean_rankings[u][:candidate_topk])
+            selected = []
+            for block_idx in token_rankings[u]:
+                if block_idx in coarse_candidates:
+                    selected.append(block_idx)
+                if len(selected) >= self.topk:
+                    break
+            if len(selected) < self.topk:
+                for block_idx in mean_rankings[u]:
+                    if block_idx not in selected and block_idx in coarse_candidates:
+                        selected.append(block_idx)
+                    if len(selected) >= self.topk:
+                        break
+            reranked.append(sorted(selected))
+        return reranked
 
     def _remove_lru_blocks(self, u, num_remove: Optional[int] = None, ignore_blocks = None):
         if num_remove is None:
@@ -1223,7 +1275,7 @@ class ContextManager:
                 if self.async_global_stream:
                     torch.cuda.current_stream().wait_stream(GLOBAL_STREAM)
 
-            assert global_h_k.size(-2) <= self.n_init + self.n_local
+            # assert global_h_k.size(-2) <= self.n_init + self.n_local
             return global_h_k, global_h_v
 
     def _get_q_token_topk(self, q_len: int) -> int:

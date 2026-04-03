@@ -30,6 +30,7 @@ class _TimerToken:
 class ReKVProfiler:
     def __init__(self):
         self.enabled = False
+        self.nvtx_enabled = True
         self.output_path = None
         self._stats = defaultdict(lambda: {
             "count": 0,
@@ -41,9 +42,11 @@ class ReKVProfiler:
         self._lock = threading.Lock()
         self._tls = threading.local()
 
-    def configure(self, enabled=False, output_path=None, reset=False):
+    def configure(self, enabled=False, output_path=None, reset=False, nvtx_enabled=None):
         with self._lock:
             self.enabled = enabled
+            if nvtx_enabled is not None:
+                self.nvtx_enabled = nvtx_enabled
             if output_path is not None:
                 self.output_path = output_path
             if reset:
@@ -70,6 +73,20 @@ class ReKVProfiler:
             return name
         return "::".join(stack + [name])
 
+    def _nvtx_enabled(self):
+        return self.nvtx_enabled and torch.cuda.is_available() and hasattr(torch.cuda, "nvtx")
+
+    @contextmanager
+    def _nvtx_range(self, name):
+        if not self._nvtx_enabled():
+            yield
+            return
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+
     def start(self, name):
         if not self.enabled:
             return None
@@ -90,41 +107,50 @@ class ReKVProfiler:
     @contextmanager
     def section(self, name):
         token = self.start(name)
-        record_ctx = torch.autograd.profiler.record_function(name) if self.enabled else nullcontext()
-        with record_ctx:
-            try:
-                yield
-            finally:
-                self.stop(token)
+        qualified_name = token[0] if token is not None else name
+        record_ctx = torch.autograd.profiler.record_function(qualified_name) if self.enabled else nullcontext()
+        with self._nvtx_range(qualified_name):
+            with record_ctx:
+                try:
+                    yield
+                finally:
+                    self.stop(token)
 
     @contextmanager
     def phase(self, name):
         stack = self._phase_stack()
-        stack.append(name)
-        try:
-            yield
-        finally:
-            stack.pop()
+        with self._nvtx_range(name):
+            stack.append(name)
+            try:
+                yield
+            finally:
+                stack.pop()
 
     def make_module_hooks(self, name):
         attr_name = f"_rekv_profile_tokens_{name.replace('.', '_')}"
 
         def pre_hook(module, _inputs):
-            if not self.enabled:
+            if not self.enabled and not self._nvtx_enabled():
                 return
             tokens = getattr(module, attr_name, None)
             if tokens is None:
                 tokens = []
                 setattr(module, attr_name, tokens)
+            qualified_name = self._qualified_name(name)
+            if self._nvtx_enabled():
+                torch.cuda.nvtx.range_push(qualified_name)
             tokens.append(self.start(name))
 
         def post_hook(module, _inputs, _output):
-            if not self.enabled:
+            if not self.enabled and not self._nvtx_enabled():
                 return
             tokens = getattr(module, attr_name, None)
             if not tokens:
                 return
-            self.stop(tokens.pop())
+            token = tokens.pop()
+            self.stop(token)
+            if self._nvtx_enabled():
+                torch.cuda.nvtx.range_pop()
 
         return pre_hook, post_hook
 
@@ -164,8 +190,13 @@ def get_profiler():
     return _GLOBAL_PROFILER
 
 
-def configure_profiling(enabled=False, output_path=None, reset=False):
-    _GLOBAL_PROFILER.configure(enabled=enabled, output_path=output_path, reset=reset)
+def configure_profiling(enabled=False, output_path=None, reset=False, nvtx_enabled=None):
+    _GLOBAL_PROFILER.configure(
+        enabled=enabled,
+        output_path=output_path,
+        reset=reset,
+        nvtx_enabled=nvtx_enabled,
+    )
     return _GLOBAL_PROFILER
 
 

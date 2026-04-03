@@ -125,7 +125,8 @@ def load_model(model_path='model_zoo/Video-LLaVA-7B-hf', n_init=None, n_local=No
                kv_repr="mean", q_repr="mean", q_token_agg="topk", q_topk_ratio=0.3,
                k_token_agg="max", k_topk_ratio=0.3,
                head_specific_retrieval=False,
-               retrieval_fusion="none", fusion_mean_topk=None, fusion_token_topk=None):
+               retrieval_fusion="none", fusion_mean_topk=None, fusion_token_topk=None,
+               rerank_candidate_topk=None):
     device = 'cuda'
     n_frame_tokens = 257
     processor = VideoLlavaProcessor.from_pretrained(model_path)
@@ -152,6 +153,7 @@ def load_model(model_path='model_zoo/Video-LLaVA-7B-hf', n_init=None, n_local=No
         'retrieval_fusion': retrieval_fusion,
         'fusion_mean_topk': fusion_mean_topk,
         'fusion_token_topk': fusion_token_topk,
+        'rerank_candidate_topk': rerank_candidate_topk,
     }
     model = VideoLlava_ReKV.from_pretrained(
         model_path, 

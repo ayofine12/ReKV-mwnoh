@@ -30,4 +30,6 @@ model_zoo/*
 !model_zoo/.gitkeep
 results/*
 !results/.gitkeep
+nsys_results/*
+ncu_results/*
 !tools/*.sh

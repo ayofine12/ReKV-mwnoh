@@ -118,7 +118,8 @@ def load_model(model_path='model_zoo/LLaVA/llava-onevision-qwen2-7b-ov-hf',
                kv_repr="mean", q_repr="mean", q_token_agg="topk", q_topk_ratio=0.3,
                k_token_agg="max", k_topk_ratio=0.3,
                head_specific_retrieval=False,
-               retrieval_fusion="none", fusion_mean_topk=None, fusion_token_topk=None):
+               retrieval_fusion="none", fusion_mean_topk=None, fusion_token_topk=None,
+               rerank_candidate_topk=None):
     device = 'cuda'
     n_frame_tokens = 196
     processor = LlavaOnevisionProcessor.from_pretrained(model_path)
@@ -145,6 +146,7 @@ def load_model(model_path='model_zoo/LLaVA/llava-onevision-qwen2-7b-ov-hf',
         'retrieval_fusion': retrieval_fusion,
         'fusion_mean_topk': fusion_mean_topk,
         'fusion_token_topk': fusion_token_topk,
+        'rerank_candidate_topk': rerank_candidate_topk,
     }
     model = LlavaOneVision_ReKV.from_pretrained(
         model_path, 
