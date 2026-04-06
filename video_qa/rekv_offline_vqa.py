@@ -131,16 +131,7 @@ class ReKVOfflineVQA(BaseVQA):
         self.qa_model.encode_init_prompt()
         self.qa_model.encode_video(video_tensor, self.encode_chunk_size)
 
-        if self.retrieval_fusion == "rerank":
-            retrieval_configs = [
-                (retrieve_size, candidate_topk)
-                for candidate_topk in self.rerank_candidate_topks
-                for retrieve_size in self.retrieve_sizes
-            ]
-        else:
-            retrieval_configs = [(retrieve_size, self.rerank_candidate_topk) for retrieve_size in self.retrieve_sizes]
-
-        for retrieve_size, rerank_candidate_topk in retrieval_configs:
+        for retrieve_size, rerank_candidate_topk in self.retrieval_configs:
             self.set_retrieval_config(
                 retrieve_size=retrieve_size,
                 rerank_candidate_topk=rerank_candidate_topk,

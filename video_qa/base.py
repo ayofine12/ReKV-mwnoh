@@ -90,9 +90,10 @@ class BaseVQA:
         self.rerank_candidate_topk = rerank_candidate_topk
         if self.retrieval_fusion == "rerank" and self.rerank_candidate_topk is None:
             self.rerank_candidate_topk = max(retrieve_size, retrieve_size * 4)
-        self.rerank_candidate_topks = list(dict.fromkeys(
-            rerank_candidate_topks or [self.rerank_candidate_topk]
-        ))
+        self.rerank_candidate_topks = list(rerank_candidate_topks or [self.rerank_candidate_topk])
+        self.retrieval_configs = self._build_retrieval_configs()
+        self.retrieve_size, self.rerank_candidate_topk = self.retrieval_configs[0]
+        self.rerank_candidate_topks = [candidate_topk for _, candidate_topk in self.retrieval_configs]
         if fusion_mean_topk is None and fusion_token_topk is None:
             fusion_mean_topk = retrieve_size // 2
             fusion_token_topk = retrieve_size - fusion_mean_topk
@@ -121,12 +122,8 @@ class BaseVQA:
         self.save_dir = save_dir
         self.choice_letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
         self.record = {}
-        for size in self.retrieve_sizes:
-            if self.retrieval_fusion == "rerank":
-                for candidate_topk in self.rerank_candidate_topks:
-                    self.record[(size, self.chunk_size, candidate_topk)] = []
-            else:
-                self.record[(size, self.chunk_size, self.rerank_candidate_topk)] = []
+        for size, candidate_topk in self.retrieval_configs:
+            self.record[(size, self.chunk_size, candidate_topk)] = []
         self.completed_questions = self._load_completed_questions()
         self.profile_video_ids = set(profile_video_ids or [])
         profiler = get_profiler()
@@ -145,6 +142,22 @@ class BaseVQA:
             )
             if not self.profile_video_ids:
                 profiler.configure(output_path=self.get_profile_json_path())
+
+    def _build_retrieval_configs(self):
+        if self.retrieval_fusion != "rerank":
+            return [(size, self.rerank_candidate_topk) for size in self.retrieve_sizes]
+
+        if len(self.rerank_candidate_topks) == 1 and len(self.retrieve_sizes) > 1:
+            candidate_topks = self.rerank_candidate_topks * len(self.retrieve_sizes)
+        elif len(self.rerank_candidate_topks) == len(self.retrieve_sizes):
+            candidate_topks = self.rerank_candidate_topks
+        else:
+            raise ValueError(
+                "rerank_candidate_topks must provide either one value or the same number "
+                f"of values as retrieve_sizes: {len(self.rerank_candidate_topks)} vs "
+                f"{len(self.retrieve_sizes)}"
+            )
+        return list(zip(self.retrieve_sizes, candidate_topks))
 
     def _build_retrieval_tag(self):
         if self.retrieval_fusion != "none":
@@ -514,9 +527,27 @@ def work(QA_CLASS):
     if not retrieve_sizes:
         retrieve_sizes = [args.retrieve_size]
     rerank_candidate_topks = [int(x.strip()) for x in args.rerank_candidate_topks.split(",") if x.strip()]
-    if not rerank_candidate_topks:
+    if args.retrieval_fusion == "rerank":
+        if not rerank_candidate_topks:
+            if args.rerank_candidate_topk is not None:
+                rerank_candidate_topks = [args.rerank_candidate_topk]
+            else:
+                rerank_candidate_topks = [max(size, size * 4) for size in retrieve_sizes]
+        elif len(rerank_candidate_topks) == 1 and len(retrieve_sizes) > 1:
+            rerank_candidate_topks = rerank_candidate_topks * len(retrieve_sizes)
+        elif len(rerank_candidate_topks) != len(retrieve_sizes):
+            raise ValueError(
+                "rerank_candidate_topks must provide either one value or the same number "
+                f"of values as retrieve_sizes: {len(rerank_candidate_topks)} vs {len(retrieve_sizes)}"
+            )
+    elif not rerank_candidate_topks:
         rerank_candidate_topks = [args.rerank_candidate_topk]
     model_retrieve_size = max(retrieve_sizes)
+    model_rerank_candidate_topk = (
+        max(rerank_candidate_topks)
+        if args.retrieval_fusion == "rerank" and rerank_candidate_topks
+        else args.rerank_candidate_topk
+    )
 
     # fix random seed
     random.seed(2024)
@@ -541,7 +572,7 @@ def work(QA_CLASS):
         retrieval_fusion=args.retrieval_fusion,
         fusion_mean_topk=args.fusion_mean_topk,
         fusion_token_topk=args.fusion_token_topk,
-        rerank_candidate_topk=args.rerank_candidate_topk,
+        rerank_candidate_topk=model_rerank_candidate_topk,
     )
 
     # Load ground truth file
@@ -568,7 +599,7 @@ def work(QA_CLASS):
         retrieval_fusion=args.retrieval_fusion,
         fusion_mean_topk=args.fusion_mean_topk,
         fusion_token_topk=args.fusion_token_topk,
-        rerank_candidate_topk=args.rerank_candidate_topk,
+        rerank_candidate_topk=model_rerank_candidate_topk,
         use_video_cache=args.use_video_cache,
         num_chunks=args.num_chunks,
         chunk_idx=args.chunk_idx,
