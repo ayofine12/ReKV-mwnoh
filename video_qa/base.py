@@ -95,16 +95,16 @@ class BaseVQA:
         self.retrieve_size, self.rerank_candidate_topk = self.retrieval_configs[0]
         self.rerank_candidate_topks = [candidate_topk for _, candidate_topk in self.retrieval_configs]
         if fusion_mean_topk is None and fusion_token_topk is None:
-            fusion_mean_topk = retrieve_size // 2
-            fusion_token_topk = retrieve_size - fusion_mean_topk
+            fusion_mean_topk = self.retrieve_size // 2
+            fusion_token_topk = self.retrieve_size - fusion_mean_topk
         elif fusion_mean_topk is None:
-            fusion_mean_topk = retrieve_size - fusion_token_topk
+            fusion_mean_topk = self.retrieve_size - fusion_token_topk
         elif fusion_token_topk is None:
-            fusion_token_topk = retrieve_size - fusion_mean_topk
+            fusion_token_topk = self.retrieve_size - fusion_mean_topk
         self.fusion_mean_topk = fusion_mean_topk
         self.fusion_token_topk = fusion_token_topk
 
-        if self.retrieval_fusion != "none":
+        if self.retrieval_fusion == "quota":
             assert self.fusion_mean_topk + self.fusion_token_topk == self.retrieve_size, (
                 f'fusion_mean_topk + fusion_token_topk must equal retrieve_size: '
                 f'{self.fusion_mean_topk} + {self.fusion_token_topk} != {self.retrieve_size}'
